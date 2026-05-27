@@ -1,1 +1,16 @@
+# Build artifacts
 /target
+
+# Secrets — NEVER commit these
+/config.toml          # your real config (may hold account id / OAuth ids)
+*.pem                 # RSA private/public keys
+*.key
+private_key*
+public_key*
+
+# Local data & logs
+/data
+*.db
+*.sqlite
+*.sqlite3
+*.log
