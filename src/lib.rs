@@ -12,3 +12,4 @@ pub mod config;
 pub mod engine;
 pub mod ibkr;
 pub mod store;
+pub mod tui;
