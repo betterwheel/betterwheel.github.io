@@ -1,0 +1,189 @@
+//! Plain data types consumed and produced by the strategy engine.
+//!
+//! Nothing here performs I/O. The IBKR layer adapts `ibapi` types into these,
+//! and the engine turns them into [`Suggestion`]s.
+
+use chrono::NaiveDate;
+use serde::{Deserialize, Serialize};
+
+/// Option right.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Right {
+    Put,
+    Call,
+}
+
+/// A single option contract's market snapshot, as the engine needs it.
+#[derive(Debug, Clone)]
+pub struct OptionQuote {
+    pub right: Right,
+    pub strike: f64,
+    pub expiry: NaiveDate,
+    pub bid: f64,
+    pub ask: f64,
+    /// Delta as IBKR reports it: calls positive, puts negative. `None` if the
+    /// greek is unavailable (no subscription / illiquid), in which case the
+    /// engine may fall back to a Black-Scholes estimate.
+    pub delta: Option<f64>,
+    pub implied_volatility: Option<f64>,
+    pub open_interest: Option<i64>,
+    pub volume: Option<i64>,
+}
+
+impl OptionQuote {
+    /// Mid price; falls back to bid when the ask is missing or non-positive.
+    pub fn mid(&self) -> f64 {
+        if self.ask > 0.0 && self.bid > 0.0 {
+            (self.bid + self.ask) / 2.0
+        } else {
+            self.bid.max(0.0)
+        }
+    }
+
+    /// Absolute delta in `[0, 1]` if known.
+    pub fn abs_delta(&self) -> Option<f64> {
+        self.delta.map(f64::abs)
+    }
+}
+
+/// Latest price of the underlying instrument.
+#[derive(Debug, Clone, Copy)]
+pub struct UnderlyingQuote {
+    pub last: f64,
+}
+
+/// Account capital snapshot used for position sizing.
+#[derive(Debug, Clone, Copy)]
+pub struct AccountState {
+    pub net_liquidation: f64,
+    /// Funds available to secure new cash-secured puts.
+    pub available_funds: f64,
+    /// Capital already committed by the app to open wheel positions.
+    pub deployed: f64,
+}
+
+/// The wheel leg a symbol is currently in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WheelState {
+    /// No position — eligible to sell a cash-secured put.
+    Idle,
+    /// A short cash-secured put is open.
+    ShortPut,
+    /// Assigned: holding >= 100 shares, eligible to sell covered calls.
+    LongShares,
+    /// A covered call is open against held shares.
+    ShortCall,
+}
+
+/// An open short option we already hold (used by the management logic).
+#[derive(Debug, Clone)]
+pub struct OpenShortOption {
+    pub right: Right,
+    pub strike: f64,
+    pub expiry: NaiveDate,
+    /// Premium received per share when the position was opened.
+    pub entry_credit: f64,
+    /// Number of contracts (positive).
+    pub quantity: i32,
+}
+
+/// A stock position held after assignment.
+#[derive(Debug, Clone, Copy)]
+pub struct SharePosition {
+    pub shares: i64,
+    /// Per-share cost basis, ideally reduced by premium already collected.
+    pub cost_basis: f64,
+}
+
+/// The action the engine recommends.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ActionKind {
+    /// Open a cash-secured put.
+    SellPut,
+    /// Open a covered call against held shares.
+    SellCall,
+    /// Buy to close an open short for profit.
+    CloseForProfit,
+    /// Defend a tested short by rolling out (and possibly down/up).
+    Roll { to_expiry: NaiveDate, to_strike: f64 },
+}
+
+/// A single recommended action with everything needed to preview/execute it.
+#[derive(Debug, Clone)]
+pub struct Suggestion {
+    pub symbol: String,
+    pub kind: ActionKind,
+    pub right: Right,
+    pub strike: f64,
+    pub expiry: NaiveDate,
+    pub dte: i64,
+    pub quantity: i32,
+    /// Suggested limit price (premium per share).
+    pub limit_price: f64,
+    /// Absolute delta of the chosen contract, if known.
+    pub delta: Option<f64>,
+    /// Total premium = `limit_price * 100 * quantity`.
+    pub premium_total: f64,
+    /// Collateral required (`strike * 100 * qty` for a CSP; 0 for a covered call).
+    pub capital_required: f64,
+    /// Annualized return on collateral as a fraction (0.30 = 30%/yr).
+    pub annualized_yield: f64,
+    /// Human-readable explanation of why this was chosen.
+    pub rationale: String,
+}
+
+/// An ordered set of suggested actions.
+#[derive(Debug, Clone, Default)]
+pub struct ActionPlan {
+    pub suggestions: Vec<Suggestion>,
+}
+
+/// Tunable strategy parameters. Defaults follow common r/thetagang norms.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EngineConfig {
+    /// Ideal absolute delta for new short options.
+    pub target_delta: f64,
+    /// Acceptable delta band for entries: `[min_delta, max_delta]`.
+    pub min_delta: f64,
+    pub max_delta: f64,
+    /// Acceptable days-to-expiration band for entries.
+    pub min_dte: i64,
+    pub max_dte: i64,
+    /// Buy-to-close once this fraction of max premium is captured.
+    pub take_profit_pct: f64,
+    /// Defend (roll) when a short's absolute delta exceeds this.
+    pub roll_delta: f64,
+    /// Also consider rolling an in-the-money short under this many DTE.
+    pub roll_dte: i64,
+    /// Skip entries whose annualized yield is below this fraction.
+    pub min_annualized_yield: f64,
+    /// Liquidity floor: skip strikes with open interest below this (if known).
+    pub min_open_interest: i64,
+    /// Ignore option prices below this (dust).
+    pub min_premium: f64,
+    /// Risk-free rate used by the Black-Scholes delta fallback.
+    pub risk_free_rate: f64,
+    /// Covered-call strikes must sit at least this fraction above cost basis.
+    pub cc_min_pct_above_basis: f64,
+}
+
+impl Default for EngineConfig {
+    fn default() -> Self {
+        Self {
+            target_delta: 0.30,
+            min_delta: 0.16,
+            max_delta: 0.35,
+            min_dte: 25,
+            max_dte: 45,
+            take_profit_pct: 0.50,
+            roll_delta: 0.50,
+            roll_dte: 21,
+            min_annualized_yield: 0.20,
+            min_open_interest: 100,
+            min_premium: 0.05,
+            risk_free_rate: 0.04,
+            cc_min_pct_above_basis: 0.0,
+        }
+    }
+}

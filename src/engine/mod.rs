@@ -1,0 +1,203 @@
+//! The strategy engine: pure functions turning market + account state into a
+//! ranked [`ActionPlan`]. No I/O lives here, so it is fully unit-testable.
+
+pub mod covered_call;
+pub mod csp;
+pub mod manage;
+pub mod math;
+pub mod types;
+
+pub use types::*;
+
+use chrono::NaiveDate;
+
+/// Everything needed to advise on a single symbol for one planning pass.
+pub struct SymbolContext<'a> {
+    pub symbol: String,
+    pub state: WheelState,
+    pub underlying: UnderlyingQuote,
+    /// Candidate chain (already narrowed by moneyness) for new entries.
+    pub option_quotes: &'a [OptionQuote],
+    /// The open short option and its current quote (for `ShortPut`/`ShortCall`).
+    pub open_short: Option<(OpenShortOption, OptionQuote)>,
+    /// Held shares (for `LongShares`/`ShortCall`).
+    pub shares: Option<SharePosition>,
+    /// Calls already written against held shares.
+    pub committed_call_contracts: i32,
+    /// Max collateral the app may deploy on a new CSP for this symbol.
+    pub max_collateral: f64,
+}
+
+/// Produce suggestions for one symbol based on its current wheel state.
+pub fn plan_for_symbol(ctx: &SymbolContext, cfg: &EngineConfig, today: NaiveDate) -> Vec<Suggestion> {
+    let mut out = Vec::new();
+    match ctx.state {
+        WheelState::Idle => {
+            if let Some(s) = csp::select_csp(
+                &ctx.symbol,
+                ctx.underlying,
+                ctx.option_quotes,
+                ctx.max_collateral,
+                cfg,
+                today,
+            ) {
+                out.push(s);
+            }
+        }
+        WheelState::ShortPut | WheelState::ShortCall => {
+            if let Some((pos, quote)) = &ctx.open_short {
+                if let Some(s) =
+                    manage::manage_short_option(&ctx.symbol, pos, quote, ctx.underlying, cfg, today)
+                {
+                    out.push(s);
+                }
+            }
+        }
+        WheelState::LongShares => {
+            if let Some(shares) = ctx.shares {
+                if let Some(s) = covered_call::select_covered_call(
+                    &ctx.symbol,
+                    ctx.underlying,
+                    shares,
+                    ctx.committed_call_contracts,
+                    ctx.option_quotes,
+                    cfg,
+                    today,
+                ) {
+                    out.push(s);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Build a full plan across many symbols, ordered so time-sensitive management
+/// actions (closes, rolls) come before new entries, then by yield.
+pub fn plan(contexts: &[SymbolContext], cfg: &EngineConfig, today: NaiveDate) -> ActionPlan {
+    let mut suggestions: Vec<Suggestion> = contexts
+        .iter()
+        .flat_map(|ctx| plan_for_symbol(ctx, cfg, today))
+        .collect();
+
+    suggestions.sort_by(|a, b| {
+        kind_priority(&a.kind)
+            .cmp(&kind_priority(&b.kind))
+            .then(
+                b.annualized_yield
+                    .partial_cmp(&a.annualized_yield)
+                    .unwrap_or(std::cmp::Ordering::Equal),
+            )
+    });
+
+    ActionPlan { suggestions }
+}
+
+/// Lower value sorts first.
+fn kind_priority(k: &ActionKind) -> u8 {
+    match k {
+        ActionKind::CloseForProfit => 0,
+        ActionKind::Roll { .. } => 1,
+        ActionKind::SellPut | ActionKind::SellCall => 2,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn day(n: i64) -> NaiveDate {
+        NaiveDate::from_ymd_opt(2026, 1, 1).unwrap() + chrono::Duration::days(n)
+    }
+
+    #[test]
+    fn idle_symbol_yields_a_csp() {
+        let quotes = vec![OptionQuote {
+            right: Right::Put,
+            strike: 95.0,
+            expiry: day(30),
+            bid: 1.75,
+            ask: 1.85,
+            delta: Some(-0.30),
+            implied_volatility: Some(0.3),
+            open_interest: Some(500),
+            volume: Some(100),
+        }];
+        let ctx = SymbolContext {
+            symbol: "AAPL".to_string(),
+            state: WheelState::Idle,
+            underlying: UnderlyingQuote { last: 100.0 },
+            option_quotes: &quotes,
+            open_short: None,
+            shares: None,
+            committed_call_contracts: 0,
+            max_collateral: 10_000.0,
+        };
+        let plan = plan(std::slice::from_ref(&ctx), &EngineConfig::default(), day(0));
+        assert_eq!(plan.suggestions.len(), 1);
+        assert_eq!(plan.suggestions[0].kind, ActionKind::SellPut);
+    }
+
+    #[test]
+    fn management_sorts_before_entries() {
+        // One idle symbol (entry) and one with a profitable short (close).
+        let put_quotes = vec![OptionQuote {
+            right: Right::Put,
+            strike: 95.0,
+            expiry: day(30),
+            bid: 1.75,
+            ask: 1.85,
+            delta: Some(-0.30),
+            implied_volatility: Some(0.3),
+            open_interest: Some(500),
+            volume: Some(100),
+        }];
+        let entry = SymbolContext {
+            symbol: "AAPL".to_string(),
+            state: WheelState::Idle,
+            underlying: UnderlyingQuote { last: 100.0 },
+            option_quotes: &put_quotes,
+            open_short: None,
+            shares: None,
+            committed_call_contracts: 0,
+            max_collateral: 10_000.0,
+        };
+
+        let close_quote = OptionQuote {
+            right: Right::Put,
+            strike: 50.0,
+            expiry: day(15),
+            bid: 0.20,
+            ask: 0.24,
+            delta: Some(-0.10),
+            implied_volatility: Some(0.3),
+            open_interest: Some(500),
+            volume: Some(100),
+        };
+        let manage = SymbolContext {
+            symbol: "MSFT".to_string(),
+            state: WheelState::ShortPut,
+            underlying: UnderlyingQuote { last: 60.0 },
+            option_quotes: &[],
+            open_short: Some((
+                OpenShortOption {
+                    right: Right::Put,
+                    strike: 50.0,
+                    expiry: day(15),
+                    entry_credit: 1.00,
+                    quantity: 1,
+                },
+                close_quote,
+            )),
+            shares: None,
+            committed_call_contracts: 0,
+            max_collateral: 10_000.0,
+        };
+
+        let plan = plan(&[entry, manage], &EngineConfig::default(), day(0));
+        assert_eq!(plan.suggestions.len(), 2);
+        // Close (management) must come first.
+        assert_eq!(plan.suggestions[0].kind, ActionKind::CloseForProfit);
+        assert_eq!(plan.suggestions[1].kind, ActionKind::SellPut);
+    }
+}
