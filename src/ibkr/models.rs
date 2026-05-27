@@ -126,11 +126,10 @@ pub fn dig_money(v: &Value, needle: &str) -> Option<f64> {
     match v {
         Value::Object(map) => {
             for (k, val) in map {
-                if k.to_ascii_lowercase().contains(&needle) {
-                    if let Some(n) = resolve_number(val) {
+                if k.to_ascii_lowercase().contains(&needle)
+                    && let Some(n) = resolve_number(val) {
                         return Some(n);
                     }
-                }
             }
             // Recurse into children if not found at this level.
             map.values().find_map(|val| dig_money(val, &needle))

@@ -1,19 +1,21 @@
-//! Connectivity + data-path spike.
+//! Connectivity + data-path spike for the IBKR **Web API** (first-party OAuth2).
 //!
-//! Validates that the app can talk to IB Gateway and pull everything the wheel
-//! engine needs, BEFORE any TUI is built on top (see the plan's milestone 1).
-//! It only *reads* and runs *what-if* previews — it never transmits an order.
+//! Validates the whole path the wheel engine needs — token, brokerage session,
+//! accounts, option chain, greeks, and a what-if/tradability probe — BEFORE any
+//! TUI is built on top. It only *reads* and runs *what-if* previews; it never
+//! transmits an order.
 //!
-//! Usage:
-//!   1. Start IB Gateway (paper), enable API, socket port 4002, trust 127.0.0.1.
-//!   2. `cargo run --bin spike -- [SYMBOL]`   (defaults to AAPL)
+//! Prereq: complete the one-time OAuth onboarding in `SETUP.md` and fill in
+//! `[connection.oauth]` in `config.toml`.
+//!
+//! Usage: `cargo run --bin spike -- [SYMBOL]`   (defaults to AAPL)
 
 use anyhow::Result;
-use chrono::{Local, NaiveDate};
+use chrono::{Datelike, Duration, Local};
 use std::path::Path;
 
 use thewheel::config::Config;
-use thewheel::ibkr::{Ibkr, Tradability};
+use thewheel::ibkr::{Tradability, WebApi};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -21,122 +23,100 @@ async fn main() -> Result<()> {
 
     let symbol = std::env::args().nth(1).unwrap_or_else(|| "AAPL".to_string());
     let cfg = Config::load(Path::new("config.toml"))?;
-    let addr = cfg.connection.address();
 
-    println!("== TheWheel spike ==");
+    println!("== TheWheel spike (Web API / OAuth2) ==");
     println!("symbol: {symbol}");
-    println!("connecting to IB Gateway at {addr} (mode {:?}, market data {:?}) ...\n",
-        cfg.connection.mode, cfg.connection.market_data);
+    println!("base:   {}", cfg.connection.base_url);
+    println!("token:  {}\n", cfg.connection.token_url());
 
-    let ibkr = match Ibkr::connect(&cfg.connection).await {
-        Ok(c) => c,
+    if !cfg.connection.oauth.is_configured() {
+        eprintln!("OAuth is not configured. Fill [connection.oauth] in config.toml — see SETUP.md.");
+        return Ok(());
+    }
+
+    let mut api = match WebApi::connect(&cfg.connection).await {
+        Ok(a) => a,
         Err(e) => {
-            eprintln!("connection failed: {e}");
-            eprintln!("\nIs IB Gateway running with the API enabled on {addr}?");
+            eprintln!("connection/auth failed: {e:#}");
             return Err(e);
         }
     };
-    println!("connected.\n");
+    println!("authenticated. account: {}\n", api.account().unwrap_or("?"));
 
     // --- Account ---
     println!("-- account summary --");
-    match ibkr.account_summary().await {
+    match api.account_summary().await {
         Ok(a) => println!(
-            "  net liq:   {}\n  cash:      {}\n  buying pwr:{}\n  avail:     {}",
-            fmt_money(a.net_liquidation),
-            fmt_money(a.total_cash),
-            fmt_money(a.buying_power),
-            fmt_money(a.available_funds),
+            "  net liq {}  cash {}  buying pwr {}  avail {}",
+            money(a.net_liquidation),
+            money(a.total_cash),
+            money(a.buying_power),
+            money(a.available_funds),
         ),
-        Err(e) => eprintln!("  account_summary error: {e}"),
+        Err(e) => eprintln!("  error: {e:#}"),
     }
 
     // --- Positions ---
     println!("\n-- positions --");
-    match ibkr.positions().await {
+    match api.positions().await {
         Ok(rows) if rows.is_empty() => println!("  (none)"),
         Ok(rows) => {
             for p in rows {
                 println!(
-                    "  {:6} {:8} qty {:>7.0} @ {:.2} {}{}",
-                    p.symbol,
-                    p.security_type,
-                    p.position,
-                    p.average_cost,
-                    if p.right.is_empty() { String::new() } else { format!("{} ", p.right) },
-                    if p.strike > 0.0 { format!("{} {:.1}", p.expiry, p.strike) } else { String::new() },
+                    "  {:8} {:5} qty {:>7.0} @ {:.2}  mkt {:.2}  uPnL {:.2}",
+                    p.symbol, p.asset_class, p.position, p.avg_price, p.mkt_price, p.unrealized_pnl
                 );
             }
         }
-        Err(e) => eprintln!("  positions error: {e}"),
+        Err(e) => eprintln!("  error: {e:#}"),
     }
 
-    // --- Option chain ---
-    println!("\n-- option chain: {symbol} --");
-    let conid = ibkr.underlying_contract_id(&symbol).await?;
+    // --- Underlying conid + price ---
+    println!("\n-- {symbol} --");
+    let conid = api.underlying_conid(&symbol).await?;
     println!("  underlying conid: {conid}");
-    let chain = ibkr.option_chain(&symbol, conid).await?;
-    println!(
-        "  exchange {} · class {} · x{} · {} expirations · {} strikes",
-        chain.exchange,
-        chain.trading_class,
-        chain.multiplier,
-        chain.expirations.len(),
-        chain.strikes.len()
-    );
-    if chain.expirations.is_empty() || chain.strikes.is_empty() {
-        eprintln!("  chain is empty — cannot continue.");
+    let spot = api.option_snapshot(conid).await.ok().and_then(|s| s.last);
+    println!("  spot: {}", spot.map(|p| format!("{p:.2}")).unwrap_or_else(|| "(no quote)".into()));
+
+    // --- Strikes for a ~35-DTE month ---
+    let month = target_month();
+    println!("  month: {month}");
+    let (_, puts) = api.strikes(conid, &month).await?;
+    if puts.is_empty() {
+        eprintln!("  no put strikes returned (try a different `month` format — see SETUP.md).");
         return Ok(());
     }
+    let spot = spot.unwrap_or_else(|| median(&puts));
+    let otm = otm_put_strikes(&puts, spot, 5);
+    println!("  {} put strikes; sampling OTM near {:.2}: {:?}", puts.len(), spot, otm);
 
-    // --- Underlying price ---
-    let und = ibkr.underlying_snapshot(&symbol).await?;
-    let spot = und.last.unwrap_or_else(|| median(&chain.strikes));
-    println!(
-        "  spot: {} {}",
-        und.last.map(|p| format!("{p:.2}")).unwrap_or_else(|| "(no quote)".into()),
-        if und.last.is_none() { format!("(using median strike {spot:.2})") } else { String::new() },
-    );
-
-    // --- Pick a ~35 DTE expiry ---
-    let today = Local::now().date_naive();
-    let Some((expiry, dte)) = pick_expiry(&chain.expirations, today) else {
-        eprintln!("  no parseable future expiration found.");
-        return Ok(());
-    };
-    println!("  target expiry: {expiry} ({dte} DTE)");
-
-    // --- Snapshot a few OTM puts ---
-    let otm_puts = otm_put_strikes(&chain.strikes, spot, 5);
-    println!("\n-- put greeks @ {expiry} (delayed/realtime per config) --");
-    for k in &otm_puts {
-        match ibkr.option_snapshot(&symbol, &expiry, *k, "P").await {
-            Ok(s) => {
-                let (delta, iv, price) = match &s.comp {
-                    Some(c) => (c.delta, c.implied_volatility, c.option_price),
-                    None => (None, None, None),
-                };
-                println!(
-                    "  {:>7.1}P  Δ {:>6}  IV {:>6}  px {:>6}{}",
-                    k,
-                    opt(delta, 2),
-                    opt(iv, 3),
-                    opt(price, 2),
-                    if s.comp.is_none() { "  (no computation — check market-data entitlement)" } else { "" },
-                );
+    // --- Greeks per OTM put ---
+    println!("\n-- put greeks @ {month} --");
+    let mut probe_conid: Option<i64> = None;
+    for k in &otm {
+        match api.option_conid(conid, &month, *k, "P").await {
+            Ok(oc) => {
+                probe_conid = Some(oc);
+                match api.option_snapshot(oc).await {
+                    Ok(s) => println!(
+                        "  {:>7.1}P  Δ {:>6}  IV {:>6}  bid {:>6}  ask {:>6}",
+                        k, optf(s.delta, 3), optf(s.implied_volatility, 3), optf(s.bid, 2), optf(s.ask, 2)
+                    ),
+                    Err(e) => eprintln!("  {k:.1}P snapshot error: {e:#}"),
+                }
             }
-            Err(e) => eprintln!("  {k:.1}P error: {e}"),
+            Err(e) => eprintln!("  {k:.1}P conid error: {e:#}"),
         }
     }
 
-    // --- Tradability probe (EU/PRIIPs) via what-if ---
-    if let Some(probe_strike) = otm_puts.last().copied() {
-        println!("\n-- tradability probe (what-if sell {probe_strike:.1}P, NOT transmitted) --");
-        match ibkr.tradability(&symbol, &expiry, probe_strike).await {
-            Tradability::Allowed { init_margin, commission } => println!(
-                "  ALLOWED · init margin {} · commission {}",
-                fmt_money(init_margin),
-                fmt_money(commission)
+    // --- Tradability probe (EU/PRIIPs) ---
+    if let Some(oc) = probe_conid {
+        println!("\n-- tradability probe (what-if SELL 1 put, NOT transmitted) --");
+        match api.tradability(oc).await {
+            Tradability::Allowed(p) => println!(
+                "  ALLOWED · margin {} · commission {}",
+                p.init_margin_change.as_deref().unwrap_or("?"),
+                p.commission.as_deref().unwrap_or("?")
             ),
             Tradability::Blocked(reason) => println!("  BLOCKED · {reason}"),
         }
@@ -146,12 +126,12 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn fmt_money(v: Option<f64>) -> String {
-    v.map(|x| format!("{x:>12.2}")).unwrap_or_else(|| "         n/a".into())
+fn money(v: Option<f64>) -> String {
+    v.map(|x| format!("{x:.2}")).unwrap_or_else(|| "n/a".into())
 }
 
-fn opt(v: Option<f64>, prec: usize) -> String {
-    v.map(|x| format!("{x:.prec$}")).unwrap_or_else(|| "  -".into())
+fn optf(v: Option<f64>, prec: usize) -> String {
+    v.map(|x| format!("{x:.prec$}")).unwrap_or_else(|| "-".into())
 }
 
 fn median(xs: &[f64]) -> f64 {
@@ -163,24 +143,16 @@ fn median(xs: &[f64]) -> f64 {
     v[v.len() / 2]
 }
 
-/// Pick the expiration closest to ~35 DTE (within the future).
-fn pick_expiry(expirations: &[String], today: NaiveDate) -> Option<(String, i64)> {
-    expirations
-        .iter()
-        .filter_map(|e| {
-            NaiveDate::parse_from_str(e, "%Y%m%d")
-                .ok()
-                .map(|d| (e.clone(), (d - today).num_days()))
-        })
-        .filter(|(_, dte)| *dte >= 1)
-        .min_by_key(|(_, dte)| (dte - 35).abs())
+/// `YYYYMM` roughly 35 days out (a typical wheel expiry month).
+fn target_month() -> String {
+    let d = Local::now().date_naive() + Duration::days(35);
+    format!("{:04}{:02}", d.year(), d.month())
 }
 
 /// Up to `n` OTM put strikes nearest to (and below) spot, deepest-OTM last.
 fn otm_put_strikes(strikes: &[f64], spot: f64, n: usize) -> Vec<f64> {
     let mut below: Vec<f64> = strikes.iter().copied().filter(|k| *k < spot).collect();
     below.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    // Closest-to-spot first, then take n, then reverse so deepest-OTM is last.
     let mut picked: Vec<f64> = below.into_iter().rev().take(n).collect();
     picked.reverse();
     picked

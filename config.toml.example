@@ -1,33 +1,52 @@
 # TheWheel configuration — copy to `config.toml` and edit.
-# Every field is optional; anything omitted uses the default shown here.
+# Most fields are optional (defaults shown); the [connection.oauth] block is
+# REQUIRED. See SETUP.md for the one-time IBKR OAuth onboarding.
 
 [connection]
-host = "127.0.0.1"
-mode = "paper"            # "paper" or "live"
-paper_port = 4002         # IB Gateway paper  (full TWS paper = 7497)
-live_port  = 4001         # IB Gateway live   (full TWS live  = 7496)
-client_id  = 100          # distinct id per concurrent API client
-# account  = "DU1234567"  # paper accounts start with "DU"; discovered if omitted
+base_url = "https://api.ibkr.com/v1/api"  # IBKR Web API host (no local gateway)
+mode = "paper"            # "paper" or "live" (reflects the OAuth-linked account)
+# account = "DU1234567"   # discovered from the session if omitted
 market_data = "delayed"   # realtime | frozen | delayed | delayed_frozen
                           # realtime needs an OPRA subscription; delayed is free
 
+[connection.oauth]        # first-party OAuth 2.0 (private_key_jwt) — see SETUP.md
+client_id  = ""           # consumer key / client id from the Self-Service portal
+kid        = ""           # key id assigned when you uploaded your public key
+credential = ""           # your IBKR username (the JWT `sub`)
+private_key_path = "private_key.pem"  # your RSA private key (PEM); keep secret
+# token_url  = "..."      # override; default = base_url + "/oauth2/token"
+# scope      = "..."      # optional
+# grant_type = "urn:ietf:params:oauth:grant-type:jwt-bearer"  # if IBKR specifies another
+
+[connection.fields]       # snapshot field codes — verify against IBKR (see SETUP.md)
+last = 31
+bid = 84
+ask = 86
+implied_volatility = 7633
+delta = 7308
+gamma = 7309
+theta = 7310
+vega = 7311
+open_interest = 7638
+volume = 87
+
 [engine]                  # wheel tuning — common r/thetagang norms
-target_delta = 0.30       # ideal short-option delta
-min_delta = 0.16          # acceptable entry delta band
+target_delta = 0.30
+min_delta = 0.16
 max_delta = 0.35
-min_dte = 25              # days-to-expiration band for entries
+min_dte = 25
 max_dte = 45
-take_profit_pct = 0.50    # buy-to-close at 50% of max premium
-roll_delta = 0.50         # defend a short once its delta exceeds this
-roll_dte = 21             # also consider rolling an ITM short under this DTE
+take_profit_pct = 0.50
+roll_delta = 0.50
+roll_dte = 21
 min_annualized_yield = 0.20
-min_open_interest = 100   # liquidity floor
-min_premium = 0.05        # ignore dust
-risk_free_rate = 0.04     # used by the Black-Scholes delta fallback
-cc_min_pct_above_basis = 0.0  # covered-call strike must sit this far above basis
+min_open_interest = 100
+min_premium = 0.05
+risk_free_rate = 0.04
+cc_min_pct_above_basis = 0.0
 
 [guardrails]
-max_total_deployed = 50000.0   # cap on total CSP collateral deployed
+max_total_deployed = 50000.0
 max_contracts_per_order = 10
-require_live_confirmation = true  # type a phrase before live trading
-read_only = false                 # true disables all order transmits
+require_live_confirmation = true
+read_only = true          # true = preview only; arm trading explicitly
