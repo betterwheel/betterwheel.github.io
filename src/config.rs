@@ -12,6 +12,7 @@ use crate::engine::types::EngineConfig;
 /// Top-level application configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
+#[derive(Default)]
 pub struct Config {
     pub connection: ConnectionConfig,
     pub engine: EngineConfig,
@@ -20,16 +21,6 @@ pub struct Config {
     pub data_dir: Option<PathBuf>,
 }
 
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            connection: ConnectionConfig::default(),
-            engine: EngineConfig::default(),
-            guardrails: Guardrails::default(),
-            data_dir: None,
-        }
-    }
-}
 
 /// Paper vs live trading. The wheel app is built paper-first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

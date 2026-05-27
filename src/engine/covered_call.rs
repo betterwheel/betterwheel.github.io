@@ -50,11 +50,10 @@ pub fn select_covered_call(
             continue;
         }
 
-        if let Some(oi) = q.open_interest {
-            if oi < cfg.min_open_interest {
+        if let Some(oi) = q.open_interest
+            && oi < cfg.min_open_interest {
                 continue;
             }
-        }
 
         let Some(abs_delta) = resolve_abs_delta(q, spot, d, cfg.risk_free_rate) else {
             continue;

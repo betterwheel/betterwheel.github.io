@@ -1,0 +1,33 @@
+# TheWheel configuration — copy to `config.toml` and edit.
+# Every field is optional; anything omitted uses the default shown here.
+
+[connection]
+host = "127.0.0.1"
+mode = "paper"            # "paper" or "live"
+paper_port = 4002         # IB Gateway paper  (full TWS paper = 7497)
+live_port  = 4001         # IB Gateway live   (full TWS live  = 7496)
+client_id  = 100          # distinct id per concurrent API client
+# account  = "DU1234567"  # paper accounts start with "DU"; discovered if omitted
+market_data = "delayed"   # realtime | frozen | delayed | delayed_frozen
+                          # realtime needs an OPRA subscription; delayed is free
+
+[engine]                  # wheel tuning — common r/thetagang norms
+target_delta = 0.30       # ideal short-option delta
+min_delta = 0.16          # acceptable entry delta band
+max_delta = 0.35
+min_dte = 25              # days-to-expiration band for entries
+max_dte = 45
+take_profit_pct = 0.50    # buy-to-close at 50% of max premium
+roll_delta = 0.50         # defend a short once its delta exceeds this
+roll_dte = 21             # also consider rolling an ITM short under this DTE
+min_annualized_yield = 0.20
+min_open_interest = 100   # liquidity floor
+min_premium = 0.05        # ignore dust
+risk_free_rate = 0.04     # used by the Black-Scholes delta fallback
+cc_min_pct_above_basis = 0.0  # covered-call strike must sit this far above basis
+
+[guardrails]
+max_total_deployed = 50000.0   # cap on total CSP collateral deployed
+max_contracts_per_order = 10
+require_live_confirmation = true  # type a phrase before live trading
+read_only = false                 # true disables all order transmits

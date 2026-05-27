@@ -45,17 +45,16 @@ pub fn plan_for_symbol(ctx: &SymbolContext, cfg: &EngineConfig, today: NaiveDate
             }
         }
         WheelState::ShortPut | WheelState::ShortCall => {
-            if let Some((pos, quote)) = &ctx.open_short {
-                if let Some(s) =
+            if let Some((pos, quote)) = &ctx.open_short
+                && let Some(s) =
                     manage::manage_short_option(&ctx.symbol, pos, quote, ctx.underlying, cfg, today)
                 {
                     out.push(s);
                 }
-            }
         }
         WheelState::LongShares => {
-            if let Some(shares) = ctx.shares {
-                if let Some(s) = covered_call::select_covered_call(
+            if let Some(shares) = ctx.shares
+                && let Some(s) = covered_call::select_covered_call(
                     &ctx.symbol,
                     ctx.underlying,
                     shares,
@@ -66,7 +65,6 @@ pub fn plan_for_symbol(ctx: &SymbolContext, cfg: &EngineConfig, today: NaiveDate
                 ) {
                     out.push(s);
                 }
-            }
         }
     }
     out
