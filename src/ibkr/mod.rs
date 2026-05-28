@@ -193,6 +193,41 @@ impl Ibkr {
         }
     }
 
+    /// Submit (transmit) or preview (what-if) an option order. A single entry
+    /// point so the TUI's preview/execute paths can't drift apart.
+    pub async fn submit_or_preview(
+        &self,
+        symbol: &str,
+        expiry_yyyymmdd: &str,
+        strike: f64,
+        right: &str,
+        side: Side,
+        quantity: i32,
+        limit: f64,
+        preview: bool,
+    ) -> Result<OrderOutcome> {
+        let contract = Contract::option(symbol, expiry_yyyymmdd, strike, right);
+        let builder = self.client.order(&contract);
+        let sided = match side {
+            Side::Buy => builder.buy(quantity),
+            Side::Sell => builder.sell(quantity),
+        };
+        let ready = sided.limit(limit).day_order();
+        if preview {
+            let state = ready
+                .analyze()
+                .await
+                .map_err(|e| anyhow!("preview {symbol} {strike}{right}@{limit}: {e}"))?;
+            Ok(OrderOutcome::Preview(state))
+        } else {
+            let id = ready
+                .submit()
+                .await
+                .map_err(|e| anyhow!("submit {symbol} {strike}{right}@{limit}: {e}"))?;
+            Ok(OrderOutcome::Submitted(format!("{id:?}")))
+        }
+    }
+
     /// Collect a one-shot market-data snapshot for a contract.
     async fn collect_snapshot(
         &self,
@@ -329,4 +364,20 @@ pub enum Tradability {
         commission: Option<f64>,
     },
     Blocked(String),
+}
+
+/// Order side for [`Ibkr::submit_or_preview`].
+#[derive(Debug, Clone, Copy)]
+pub enum Side {
+    Buy,
+    Sell,
+}
+
+/// Result of [`Ibkr::submit_or_preview`].
+#[derive(Debug)]
+pub enum OrderOutcome {
+    /// What-if margin / commission impact.
+    Preview(OrderState),
+    /// Live submission succeeded; carries the IBKR order id (formatted).
+    Submitted(String),
 }

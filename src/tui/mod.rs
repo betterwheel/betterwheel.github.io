@@ -9,6 +9,7 @@ pub mod app;
 pub mod demo;
 pub mod ui;
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -17,12 +18,18 @@ use futures::StreamExt;
 use ratatui::DefaultTerminal;
 
 use crate::config::Config;
+use crate::ibkr::Ibkr;
 use crate::store::Store;
 use app::App;
 
 /// Run the TUI until the user quits.
-pub async fn run(mut terminal: DefaultTerminal, cfg: Config, store: Store) -> Result<()> {
-    let mut app = App::new(cfg, &store).await?;
+pub async fn run(
+    mut terminal: DefaultTerminal,
+    cfg: Config,
+    store: Store,
+    ibkr: Option<Arc<Ibkr>>,
+) -> Result<()> {
+    let mut app = App::new(cfg, ibkr, &store).await?;
     let mut events = EventStream::new();
     let mut tick = tokio::time::interval(Duration::from_millis(250));
 
