@@ -102,7 +102,7 @@ impl App {
             account: None,
             selected: 0,
             input: InputMode::Normal,
-            status: "offline — showing demo data. See SETUP.md to connect.".to_string(),
+            status: "offline — showing demo data. Start IB Gateway and configure config.toml to connect.".to_string(),
             connected: false,
             should_quit: false,
         };
@@ -233,7 +233,7 @@ impl App {
         if self.connected {
             "connected".into()
         } else {
-            "offline — showing demo data. See SETUP.md to connect.".into()
+            "offline — showing demo data. Start IB Gateway and configure config.toml to connect.".into()
         }
     }
 

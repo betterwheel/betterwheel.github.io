@@ -199,7 +199,7 @@ fn render_help(frame: &mut Frame, area: Rect) {
         Line::from("  q  or  Ctrl-C    quit"),
         Line::from(""),
         Line::from(Span::styled(
-            "Offline mode shows demo data. Complete SETUP.md and configure OAuth to go live.",
+            "Offline mode shows demo data. Start IB Gateway and configure config.toml to go live.",
             Style::new().fg(Color::DarkGray),
         )),
     ];
