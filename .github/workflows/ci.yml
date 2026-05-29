@@ -1,0 +1,86 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+    tags: ["v*"]
+  pull_request:
+    branches: [master]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  # Lint + test once on Linux; the strategy logic is platform-independent.
+  test:
+    name: test & clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: clippy
+        run: cargo clippy --all-targets
+      - name: test
+        run: cargo test
+
+  # Native release binaries for Linux + both macOS arches, uploaded as artifacts.
+  build:
+    name: build ${{ matrix.target }}
+    needs: test
+    if: github.event_name == 'push'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-latest # Apple Silicon
+            target: aarch64-apple-darwin
+          - os: macos-13 # Intel
+            target: x86_64-apple-darwin
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: build
+        run: cargo build --release --locked --target ${{ matrix.target }} --bin thewheel
+      - name: package
+        run: |
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/thewheel" "dist/thewheel-${{ matrix.target }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: thewheel-${{ matrix.target }}
+          path: dist/thewheel-${{ matrix.target }}
+          if-no-files-found: error
+
+  # On a v* tag, gather the per-target binaries into a GitHub Release.
+  release:
+    name: release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: collect binaries
+        run: |
+          mkdir -p dist
+          find artifacts -type f -name 'thewheel-*' -exec cp {} dist/ \;
+          ls -l dist
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
