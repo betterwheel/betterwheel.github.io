@@ -14,7 +14,7 @@ use tokio::sync::mpsc;
 use tokio::time::timeout;
 
 use ibapi::accounts::types::AccountGroup;
-use ibapi::contracts::{OptionChain, OptionComputation};
+use ibapi::contracts::{LegAction, OptionChain, OptionComputation};
 use ibapi::orders::{OrderState, Orders};
 use ibapi::prelude::*;
 
@@ -190,6 +190,29 @@ impl Ibkr {
         Ok(cd.contract.contract_id)
     }
 
+    /// Resolve a single option leg's IBKR contract id (`conid`). Combo legs are
+    /// keyed by conid, so a spread order must resolve each leg first. Mirrors
+    /// [`Self::underlying_contract_id`].
+    pub async fn option_contract_id(
+        &self,
+        symbol: &str,
+        expiry_yyyymmdd: &str,
+        strike: f64,
+        right: &str,
+    ) -> Result<i32> {
+        let contract = Contract::option(symbol, expiry_yyyymmdd, strike, right);
+        let details = self
+            .client
+            .contract_details(&contract)
+            .await
+            .map_err(|e| anyhow!("contract_details {symbol} {strike}{right} {expiry_yyyymmdd}: {e}"))?;
+        let cd = details
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow!("no contract details for {symbol} {strike}{right} {expiry_yyyymmdd}"))?;
+        Ok(cd.contract.contract_id)
+    }
+
     /// Option-chain metadata (expirations + strikes) for an underlying.
     pub async fn option_chain(&self, symbol: &str, underlying_conid: i32) -> Result<ChainMeta> {
         let mut sub = self
@@ -303,6 +326,74 @@ impl Ibkr {
                 .map_err(|e| anyhow!("submit {order}: {e}"))?;
             // Store the bare numeric id so it matches `OrderStatus.order_id`
             // from the update stream (see `stream_order_events`).
+            Ok(OrderOutcome::Submitted(id.0.to_string()))
+        }
+    }
+
+    /// Submit (transmit) or preview (what-if) a **defined-risk vertical put
+    /// spread** as a single atomic combo (BAG) order — the Hedged Wheel's entry.
+    /// Single entry point, mirroring [`Self::submit_or_preview`], so the TUI's
+    /// preview/execute paths can't drift apart.
+    ///
+    /// The combo is `[Buy long, Sell short]`; **buying** that package opens a put
+    /// credit spread (buy the cheaper protective put, sell the nearer put). IBKR's
+    /// combo limit is a net *debit*, so a credit is submitted as a **negative**
+    /// price (`-net_credit`). Always preview against a live Gateway and sanity-
+    /// check the returned margin (≈ the spread width) before any live submit.
+    pub async fn submit_or_preview_spread(
+        &self,
+        order: &SpreadOrder<'_>,
+        preview: bool,
+    ) -> Result<OrderOutcome> {
+        // Combo legs are keyed by contract id, so resolve both legs first.
+        let long_id = self
+            .option_contract_id(order.symbol, order.expiry_yyyymmdd, order.long_strike, "P")
+            .await?;
+        let short_id = self
+            .option_contract_id(order.symbol, order.expiry_yyyymmdd, order.short_strike, "P")
+            .await?;
+        if long_id == short_id {
+            return Err(anyhow!(
+                "spread {} {:.1}/{:.1}: both legs resolved to the same contract",
+                order.symbol,
+                order.short_strike,
+                order.long_strike
+            ));
+        }
+
+        // BAG contract. `vertical()` would leave each leg's exchange empty; set it
+        // to SMART explicitly. `build()` leaves the symbol blank — IBKR needs the
+        // underlying symbol on the bag, so set it after.
+        let mut contract = Contract::spread()
+            .add_leg(long_id, LegAction::Buy)
+            .on_exchange("SMART")
+            .done()
+            .add_leg(short_id, LegAction::Sell)
+            .on_exchange("SMART")
+            .done()
+            .build()
+            .map_err(|e| anyhow!("build spread {}: {e}", order.symbol))?;
+        contract.symbol = order.symbol.into();
+
+        // Credit convention: buy the package at a negative net price = receive credit.
+        let combo_limit = -order.net_credit;
+        let ready = self
+            .client
+            .order(&contract)
+            .buy(order.quantity)
+            .limit(combo_limit)
+            .day_order();
+        if preview {
+            let state = timeout(Duration::from_secs(10), ready.analyze())
+                .await
+                .map_err(|_| anyhow!("preview {order}: timed out (is the Gateway API read-only?)"))?
+                .map_err(|e| anyhow!("preview {order}: {e}"))?;
+            Ok(OrderOutcome::Preview(Box::new(state)))
+        } else {
+            let id = ready
+                .submit()
+                .await
+                .map_err(|e| anyhow!("submit {order}: {e}"))?;
             Ok(OrderOutcome::Submitted(id.0.to_string()))
         }
     }
@@ -565,6 +656,39 @@ impl std::fmt::Display for OptionOrder<'_> {
             f,
             "{} {}x {} {:.1}{} {} @{:.2}",
             self.side, self.quantity, self.symbol, self.strike, self.right, self.expiry_yyyymmdd, self.limit
+        )
+    }
+}
+
+/// A defined-risk vertical **put credit spread** order (the Hedged Wheel's
+/// entry): sell `short_strike`, buy `long_strike` (further OTM) for protection,
+/// submitted as one combo. Borrows its strings like [`OptionOrder`].
+#[derive(Debug, Clone, Copy)]
+pub struct SpreadOrder<'a> {
+    pub symbol: &'a str,
+    /// Expiry as `YYYYMMDD` (both legs share it).
+    pub expiry_yyyymmdd: &'a str,
+    /// The nearer put we sell.
+    pub short_strike: f64,
+    /// The further-OTM put we buy as protection (`< short_strike`).
+    pub long_strike: f64,
+    pub quantity: i32,
+    /// Net credit per share to receive (positive); submitted as a negative combo
+    /// limit per IBKR's credit convention.
+    pub net_credit: f64,
+}
+
+impl std::fmt::Display for SpreadOrder<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "SELL {}x {} {:.1}/{:.1}P {} @{:.2}cr",
+            self.quantity,
+            self.symbol,
+            self.short_strike,
+            self.long_strike,
+            self.expiry_yyyymmdd,
+            self.net_credit
         )
     }
 }

@@ -68,7 +68,10 @@ fn plan_for_symbol_mode(
                 out.push(s);
             }
         }
-        WheelState::ShortPut | WheelState::ShortCall => {
+        // A hedged short put is managed exactly like a bare short put on its
+        // short leg — close-for-profit or roll the short; the long put is left
+        // alone as protection (spread close/roll as a combo is future work).
+        WheelState::ShortPut | WheelState::HedgedShortPut | WheelState::ShortCall => {
             if let Some((pos, quote)) = &ctx.open_short
                 && let Some(s) =
                     manage::manage_short_option(&ctx.symbol, pos, quote, ctx.underlying, cfg, today)
