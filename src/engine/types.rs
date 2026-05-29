@@ -200,3 +200,39 @@ impl Default for EngineConfig {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wheel_state_string_roundtrips() {
+        for s in [
+            WheelState::Idle,
+            WheelState::ShortPut,
+            WheelState::LongShares,
+            WheelState::ShortCall,
+        ] {
+            assert_eq!(WheelState::parse(s.as_str()), s, "roundtrip {:?}", s);
+        }
+        // Unknown / corrupt stored states fold to Idle (never miscounted as open).
+        assert_eq!(WheelState::parse("nonsense"), WheelState::Idle);
+        assert_eq!(WheelState::parse(""), WheelState::Idle);
+        assert_eq!(WheelState::default(), WheelState::Idle);
+    }
+
+    #[test]
+    fn option_quote_mid_falls_back_to_bid() {
+        let q = OptionQuote {
+            right: Right::Put, strike: 100.0,
+            expiry: NaiveDate::from_ymd_opt(2026, 6, 19).unwrap(),
+            bid: 1.0, ask: 1.4, delta: Some(-0.3), implied_volatility: Some(0.3),
+            open_interest: None, volume: None,
+        };
+        assert!((q.mid() - 1.2).abs() < 1e-9);
+        // Missing ask → fall back to bid, not a bogus midpoint.
+        let no_ask = OptionQuote { ask: 0.0, ..q.clone() };
+        assert!((no_ask.mid() - 1.0).abs() < 1e-9);
+        assert_eq!(q.abs_delta(), Some(0.3));
+    }
+}
