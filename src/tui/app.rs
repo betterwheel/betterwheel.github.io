@@ -1349,6 +1349,20 @@ impl App {
         self.status = "connected — refreshing live data…".into();
     }
 
+    /// Drop to offline after the live connection vanished (Gateway closed/crashed).
+    /// Clears the client and stale account so the UI stops claiming "live"; the
+    /// last suggestions stay visible but are non-executable (the execute path is
+    /// gated on a live `ibkr`). The caller restarts the reconnect loop.
+    pub(super) fn set_disconnected(&mut self, reason: String) {
+        self.ibkr = None;
+        self.connected = false;
+        self.account = None;
+        self.reloading = false;
+        self.reload_started = None;
+        self.offline_reason = Some(reason.clone());
+        self.status = reason;
+    }
+
     /// Record why we're offline (shown on the dashboard).
     pub(super) fn set_offline_reason(&mut self, reason: String) {
         self.offline_reason = Some(reason);
