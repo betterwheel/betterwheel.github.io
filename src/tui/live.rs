@@ -22,8 +22,10 @@ use crate::store::{JournalRow, Store, WatchlistRow, WheelPositionRow};
 /// Keep only OTM strikes within this fraction of spot when building a chain
 /// (bounds how far OTM we'll quote for entries / covered calls).
 const MAX_OTM_MONEYNESS: f64 = 0.15;
-/// Cap on per-symbol option snapshots, to bound market-data requests.
-const MAX_CHAIN_STRIKES: usize = 5;
+/// Cap on per-symbol option snapshots, to bound market-data requests. Sampled
+/// *spread across* the OTM range (see [`sample_spread`]) so the target-delta
+/// band is covered, then fetched concurrently.
+const MAX_CHAIN_STRIKES: usize = 8;
 /// Far-OTM put target (fraction of spot) used by the tradability permission probe.
 const PROBE_OTM_FRACTION: f64 = 0.85;
 
@@ -471,9 +473,10 @@ async fn gather_chain_quotes(
         return Ok(None);
     }
 
-    // Keep only OTM strikes within 15% of spot, nearest-to-spot first, capped at
-    // 5 so per-contract market-data requests stay bounded.
-    let mut strikes: Vec<f64> = chain
+    // Sample OTM strikes (within 15% of spot) spread *across* the range, not the
+    // nearest-to-spot ones — those are all near-ATM/high-delta and miss the
+    // wheel's target-delta band entirely. The engine then filters by delta.
+    let mut otm: Vec<f64> = chain
         .strikes
         .iter()
         .copied()
@@ -481,21 +484,25 @@ async fn gather_chain_quotes(
             *k > 0.0 && is_otm(right, *k, spot) && moneyness(right, *k, spot) <= MAX_OTM_MONEYNESS
         })
         .collect();
-    strikes.sort_by(|a, b| {
-        (a - spot)
-            .abs()
-            .partial_cmp(&(b - spot).abs())
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    strikes.truncate(MAX_CHAIN_STRIKES);
+    otm.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let strikes = sample_spread(&otm, MAX_CHAIN_STRIKES);
     if strikes.is_empty() {
         return Ok(None);
     }
 
+    // Fetch the strikes' snapshots concurrently: delayed data is slow, so a
+    // serial loop would either drop quotes (short timeout) or take N × timeout.
     let right_char = right_char(right);
+    let snaps = futures::future::join_all(
+        strikes
+            .iter()
+            .map(|&k| ibkr.option_snapshot(symbol, &expiry_str, k, right_char)),
+    )
+    .await;
+
     let mut quotes: Vec<OptionQuote> = Vec::with_capacity(strikes.len());
-    for k in strikes {
-        if let Ok(snap) = ibkr.option_snapshot(symbol, &expiry_str, k, right_char).await
+    for (&k, snap) in strikes.iter().zip(snaps) {
+        if let Ok(snap) = snap
             && let Some(comp) = snap.comp
         {
             let price = comp.option_price.or(snap.last).unwrap_or(0.0);
@@ -631,6 +638,27 @@ fn pick_expiry(expirations: &[String], today: NaiveDate, target_dte: i64) -> Opt
         .min_by_key(|(_, dte)| (dte - target_dte).abs())
 }
 
+/// Sample up to `n` values spread evenly across a sorted slice. Taking the `n`
+/// values nearest one end (e.g. strikes nearest spot) clusters the sample there;
+/// an even spread keeps the whole range — and so the target-delta band — covered
+/// regardless of strike increment. Returns the slice unchanged when it has `n`
+/// or fewer elements.
+fn sample_spread(sorted: &[f64], n: usize) -> Vec<f64> {
+    if n == 0 {
+        return Vec::new();
+    }
+    if sorted.len() <= n {
+        return sorted.to_vec();
+    }
+    if n == 1 {
+        return vec![sorted[0]];
+    }
+    let last = sorted.len() - 1;
+    let mut out: Vec<f64> = (0..n).map(|i| sorted[i * last / (n - 1)]).collect();
+    out.dedup();
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -724,5 +752,19 @@ mod tests {
         let exps = vec!["20260101".to_string(), "20260630".to_string()];
         let (chosen, _) = pick_expiry(&exps, today, 35).expect("a future expiry");
         assert_eq!(chosen, "20260630");
+    }
+
+    #[test]
+    fn sample_spread_covers_the_whole_range() {
+        let xs: Vec<f64> = (0..20).map(|i| i as f64).collect();
+        let s = sample_spread(&xs, 5);
+        assert_eq!(s.len(), 5);
+        assert_eq!(s.first(), Some(&0.0));
+        assert_eq!(s.last(), Some(&19.0)); // reaches the deep-OTM end
+        assert!(s.iter().any(|&x| (8.0..=11.0).contains(&x))); // and the middle
+        // Small inputs pass through; edge counts don't panic.
+        assert_eq!(sample_spread(&[1.0, 2.0], 5), vec![1.0, 2.0]);
+        assert_eq!(sample_spread(&[], 5), Vec::<f64>::new());
+        assert_eq!(sample_spread(&[1.0, 2.0, 3.0], 1), vec![1.0]);
     }
 }

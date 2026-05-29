@@ -222,7 +222,9 @@ impl Ibkr {
     ) -> Result<SnapshotData> {
         let contract = Contract::option(symbol, expiry_yyyymmdd, strike, right);
         // 100=option volume, 101=option open interest, 106=implied vol/greeks.
-        self.collect_snapshot(&contract, &["100", "101", "106"], Duration::from_secs(10))
+        // 18s (not 10): free *delayed* greeks can take well over 10s to compute,
+        // and dropping them leaves the engine with no in-band quote to rank.
+        self.collect_snapshot(&contract, &["100", "101", "106"], Duration::from_secs(18))
             .await
     }
 

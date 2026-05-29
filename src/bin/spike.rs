@@ -107,7 +107,7 @@ async fn main() -> Result<()> {
     println!("  target expiry: {expiry} ({dte} DTE)");
 
     // --- Snapshot a few OTM puts ---
-    let otm_puts = otm_put_strikes(&chain.strikes, spot, 5);
+    let otm_puts = otm_put_strikes(&chain.strikes, spot, 10);
     println!("\n-- put greeks @ {expiry} (delayed/realtime per config) --");
     for k in &otm_puts {
         match ibkr.option_snapshot(&symbol, &expiry, *k, "P").await {
