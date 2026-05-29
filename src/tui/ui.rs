@@ -28,7 +28,15 @@ pub fn render(frame: &mut Frame, app: &App) {
 fn render_tabs(frame: &mut Frame, app: &App, area: Rect) {
     let titles = Tab::ALL.iter().map(|t| Line::from(format!(" {} ", t.title())));
     let conn = if app.connected { "● live" } else { "○ offline" };
-    let sync = if app.is_loading() { "  ⟳ syncing" } else { "" };
+    let sync = match app.loading_elapsed() {
+        Some(d) => {
+            // Braille spinner advanced off elapsed time so it animates each tick.
+            const FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+            let f = FRAMES[(d.as_millis() / 120) as usize % FRAMES.len()];
+            format!("  {f} syncing {}s", d.as_secs())
+        }
+        None => String::new(),
+    };
     let armed = if app.armed { "  ⚡ ARMED" } else { "" };
     let title = format!(
         "TheWheel  [{}]  {conn}{sync}  ·  {} open{armed}",
@@ -69,6 +77,7 @@ fn render_dashboard(frame: &mut Frame, app: &App, area: Rect) {
             money(a.total_cash),
             money(a.buying_power)
         ),
+        None if app.connected => "—  (fetching…)".into(),
         None => match &app.offline_reason {
             Some(r) => format!("—  ({r})"),
             None => "—  (offline; start IB Gateway/TWS and set [connection] in config.toml)".into(),
@@ -118,10 +127,19 @@ fn render_dashboard(frame: &mut Frame, app: &App, area: Rect) {
             )),
         ]),
         Line::from(""),
-        Line::from(Span::styled(
-            "Add symbols on the Watchlist tab; the Suggestions tab ranks cash-secured puts.",
-            Style::new().fg(Color::DarkGray),
-        )),
+        match app.loading_elapsed() {
+            Some(d) => Line::from(Span::styled(
+                format!(
+                    "⟳ Syncing live data from IB Gateway… {}s   (first sync is slow on delayed data)",
+                    d.as_secs()
+                ),
+                Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            )),
+            None => Line::from(Span::styled(
+                "Add symbols on the Watchlist tab; the Suggestions tab ranks cash-secured puts.",
+                Style::new().fg(Color::DarkGray),
+            )),
+        },
     ];
     frame.render_widget(
         Paragraph::new(lines)
@@ -181,10 +199,12 @@ fn render_suggestions(frame: &mut Frame, app: &App, area: Rect) {
         Constraint::Length(7),
         Constraint::Length(10),
     ];
-    let title = if app.suggestions.is_empty() {
-        " Suggestions — add watchlist symbols, then press 'r' ".to_string()
-    } else {
+    let title = if !app.suggestions.is_empty() {
         format!(" Suggestions ({}) — cash-secured puts, best yield first ", app.suggestions.len())
+    } else if let Some(d) = app.loading_elapsed() {
+        format!(" Suggestions — ⟳ syncing live data… {}s ", d.as_secs())
+    } else {
+        " Suggestions — none yet (press 'r' to refresh, or add higher-IV tickers) ".to_string()
     };
     frame.render_widget(
         Table::new(rows, widths).header(header).block(Block::bordered().title(title)),

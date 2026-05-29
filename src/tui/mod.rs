@@ -57,6 +57,13 @@ pub async fn run(
         None
     };
 
+    // Kick the first live data load off the event loop so the UI appears
+    // instantly (showing local state + a sync indicator) instead of blocking
+    // startup on the slow broker gather. Offline, startup data is already loaded.
+    if app.ibkr.is_some() {
+        app.request_reload(&store).await;
+    }
+
     while !app.should_quit {
         terminal.draw(|frame| ui::render(frame, &app))?;
 
