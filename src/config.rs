@@ -56,6 +56,9 @@ pub struct ConnectionConfig {
     /// Account id (e.g. "DU1234567" for paper). Optional; discovered if absent.
     pub account: Option<String>,
     pub market_data: MarketDataPref,
+    /// When offline, retry connecting to Gateway every this many seconds.
+    /// `0` disables auto-reconnect. The retry runs off the UI thread.
+    pub reconnect_secs: u64,
 }
 
 impl Default for ConnectionConfig {
@@ -68,6 +71,7 @@ impl Default for ConnectionConfig {
             client_id: 100,
             account: None,
             market_data: MarketDataPref::Delayed,
+            reconnect_secs: 15,
         }
     }
 }

@@ -26,6 +26,27 @@ pub struct Ibkr {
     client: Arc<Client>,
 }
 
+/// Turn a [`Ibkr::connect`] failure into a short, actionable hint for the UI.
+///
+/// The disclaimer case is a heuristic: on a paper account, Gateway *resets the
+/// API socket* (os error 54 / "reset by peer") immediately after sending error
+/// 10141 when the simulated-trading disclaimer hasn't been accepted — so the
+/// error that reaches us is the reset, not the code itself.
+pub fn connect_failure_hint(err: &anyhow::Error) -> String {
+    let low = err.to_string().to_ascii_lowercase();
+    if low.contains("reset by peer") || low.contains("os error 54") {
+        "IB Gateway reset the API session — on a paper account, accept the \
+         simulated-trading disclaimer in Gateway/TWS (error 10141)"
+            .into()
+    } else if low.contains("refused") || low.contains("os error 61") {
+        "IB Gateway not reachable — is it running with the API socket port open?".into()
+    } else if low.contains("timed out") || low.contains("timeout") {
+        "IB Gateway connection timed out — check host/port and that the API is enabled".into()
+    } else {
+        format!("connect failed: {err}")
+    }
+}
+
 impl Ibkr {
     /// Connect to the configured Gateway and apply the market-data preference.
     pub async fn connect(cfg: &ConnectionConfig) -> Result<Self> {
@@ -597,4 +618,41 @@ pub enum OrderOutcome {
     Preview(Box<OrderState>),
     /// Live submission succeeded; carries the IBKR order id (formatted).
     Submitted(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::connect_failure_hint;
+    use anyhow::anyhow;
+
+    #[test]
+    fn connect_hint_flags_paper_disclaimer_on_reset() {
+        // Gateway resets the socket right after error 10141 when the paper
+        // disclaimer hasn't been accepted, so what reaches us is the reset.
+        let hint = connect_failure_hint(&anyhow!(
+            "connect to 127.0.0.1:4002: Connection reset by peer (os error 54)"
+        ));
+        assert!(hint.contains("10141"), "got: {hint}");
+        assert!(
+            hint.to_ascii_lowercase().contains("disclaimer"),
+            "got: {hint}"
+        );
+    }
+
+    #[test]
+    fn connect_hint_flags_refused_as_not_running() {
+        let hint = connect_failure_hint(&anyhow!(
+            "connect to 127.0.0.1:4002: Connection refused (os error 61)"
+        ));
+        assert!(
+            hint.to_ascii_lowercase().contains("not reachable"),
+            "got: {hint}"
+        );
+    }
+
+    #[test]
+    fn connect_hint_falls_back_to_raw_error() {
+        let hint = connect_failure_hint(&anyhow!("some weird handshake failure"));
+        assert!(hint.contains("some weird handshake failure"), "got: {hint}");
+    }
 }

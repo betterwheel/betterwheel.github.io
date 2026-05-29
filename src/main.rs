@@ -21,10 +21,10 @@ async fn main() -> Result<()> {
     let _log_guard = init_logging(&data_dir);
 
     let store = Store::open(&data_dir.join("thewheel.db")).await?;
-    let ibkr = try_connect_ibkr(&cfg).await;
+    let (ibkr, offline_reason) = try_connect_ibkr(&cfg).await;
 
     let terminal = ratatui::init();
-    let result = tui::run(terminal, cfg, store, ibkr).await;
+    let result = tui::run(terminal, cfg, store, ibkr, offline_reason).await;
     ratatui::restore();
 
     if let Err(e) = &result {
@@ -33,22 +33,22 @@ async fn main() -> Result<()> {
     result
 }
 
-/// Try to connect to IB Gateway. Returns `None` after a 5s timeout / failure
-/// so the TUI can still start offline.
-async fn try_connect_ibkr(cfg: &Config) -> Option<Arc<Ibkr>> {
+/// Try to connect to IB Gateway. On a 5s timeout / failure returns `(None, hint)`
+/// so the TUI can still start offline and explain *why* it's offline.
+async fn try_connect_ibkr(cfg: &Config) -> (Option<Arc<Ibkr>>, Option<String>) {
     let addr = cfg.connection.address();
     match tokio::time::timeout(Duration::from_secs(5), Ibkr::connect(&cfg.connection)).await {
         Ok(Ok(ib)) => {
             tracing::info!("connected to IB Gateway at {addr}");
-            Some(Arc::new(ib))
+            (Some(Arc::new(ib)), None)
         }
         Ok(Err(e)) => {
             tracing::warn!("Gateway connect to {addr} failed: {e}; running offline");
-            None
+            (None, Some(thewheel::ibkr::connect_failure_hint(&e)))
         }
         Err(_) => {
             tracing::warn!("Gateway connect to {addr} timed out; running offline");
-            None
+            (None, Some("IB Gateway connection timed out — is it running?".into()))
         }
     }
 }
