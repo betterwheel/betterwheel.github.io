@@ -604,11 +604,36 @@ fn map_order_update(update: ibapi::orders::OrderUpdate) -> Option<OrderEvent> {
             remaining: s.remaining,
             avg_fill_price: s.average_fill_price,
         }),
-        OrderUpdate::Message(n) => Some(OrderEvent::Notice(format!("{n:?}"))),
+        OrderUpdate::Message(n) => {
+            // Connectivity/system warnings, cancel confirmations, and contract /
+            // market-data lookup misses are non-actionable — log them but keep
+            // them off the status line. Surface the rest as a clean "[code] text".
+            if notice_is_noise(n.code) {
+                tracing::debug!("broker notice [{}]: {}", n.code, n.message);
+                None
+            } else {
+                tracing::info!("broker notice [{}]: {}", n.code, n.message);
+                Some(OrderEvent::Notice(format!("[{}] {}", n.code, n.message)))
+            }
+        }
         OrderUpdate::OpenOrder(_)
         | OrderUpdate::ExecutionData(_)
         | OrderUpdate::CommissionReport(_) => None,
     }
+}
+
+/// Whether a broker notice is non-actionable for the wheel app, so it's logged
+/// but kept off the status line. Covers ibapi's connectivity/system + warning
+/// tiers, order-cancel confirmations (the cancel itself arrives via `OrderStatus`),
+/// and the lookup/market-data codes expected while probing chains and snapshots.
+fn notice_is_noise(code: i32) -> bool {
+    use ibapi::messages::{ORDER_CANCELLED_CODE, SYSTEM_MESSAGE_CODES, WARNING_CODE_RANGE};
+    WARNING_CODE_RANGE.contains(&code)
+        || SYSTEM_MESSAGE_CODES.contains(&code)
+        || code == ORDER_CANCELLED_CODE
+        // 200: no security definition found; 10091/10167: delayed / unsubscribed
+        // market data — all expected noise during chain & snapshot requests.
+        || matches!(code, 200 | 10091 | 10167)
 }
 
 /// Result of [`Ibkr::submit_or_preview`].
@@ -622,8 +647,21 @@ pub enum OrderOutcome {
 
 #[cfg(test)]
 mod tests {
-    use super::connect_failure_hint;
+    use super::{connect_failure_hint, notice_is_noise};
     use anyhow::anyhow;
+
+    #[test]
+    fn notice_noise_filters_only_benign_codes() {
+        // Connectivity/system + warning tiers, cancel confirmation, and the
+        // probe-time lookup / market-data codes are noise.
+        for code in [1100, 1102, 1300, 2100, 2104, 2158, 2169, 202, 200, 10091, 10167] {
+            assert!(notice_is_noise(code), "expected {code} to be filtered");
+        }
+        // Real, actionable errors (e.g. order rejections) must still surface.
+        for code in [201, 203, 321, 2099, 2170, 10147] {
+            assert!(!notice_is_noise(code), "expected {code} to surface");
+        }
+    }
 
     #[test]
     fn connect_hint_flags_paper_disclaimer_on_reset() {
