@@ -1723,6 +1723,329 @@ mod tests {
         assert!(!app.suggestions.is_empty());
     }
 
+    // --- shared test helpers ---
+
+    async fn offline_app(store: &Store) -> App {
+        App::new(Config::default(), None, store).await.unwrap()
+    }
+
+    fn sell_put(qty: i32) -> Suggestion {
+        let mut s = sug(ActionKind::SellPut, Right::Put);
+        s.quantity = qty;
+        s
+    }
+
+    async fn seed_submitted(store: &Store, symbol: &str, oid: &str) {
+        store
+            .record(&NewJournalEntry {
+                symbol: symbol.into(),
+                action: "SellPut".into(),
+                quantity: 1,
+                limit_price: Some(1.80),
+                status: "submitted".into(),
+                ibkr_order_id: Some(oid.into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+    }
+
+    fn status_event(order_id: i32, status: &str, filled: f64, avg: f64) -> OrderEvent {
+        OrderEvent::Status {
+            order_id,
+            status: status.into(),
+            filled,
+            remaining: 0.0,
+            avg_fill_price: avg,
+        }
+    }
+
+    fn watch_row(symbol: &str, tradable: Option<i64>) -> WatchlistRow {
+        WatchlistRow {
+            symbol: symbol.into(),
+            sec_type: "STK".into(),
+            enabled: 1,
+            tradable,
+            tradable_reason: None,
+            conid: None,
+            notes: None,
+            added_at: String::new(),
+        }
+    }
+
+    fn pending(close_oid: &str, reconstructed: bool) -> PendingRoll {
+        PendingRoll {
+            symbol: "AAPL".into(),
+            right: "P",
+            near_strike: 100.0,
+            near_expiry: "20260619".into(),
+            to_strike: 95.0,
+            to_expiry: "20260717".into(),
+            quantity: 1,
+            far_limit: 2.00,
+            close_oid: close_oid.into(),
+            reconstructed,
+        }
+    }
+
+    // --- money-safety: execute_suggestion guardrails ---
+    // These checks short-circuit BEFORE any broker call, so they're fully
+    // testable offline. A regression here could transmit an unintended or
+    // oversized live order, so each gate is pinned down.
+
+    #[tokio::test]
+    async fn execute_blocked_when_disarmed() {
+        let store = Store::open_in_memory().await.unwrap();
+        let mut app = offline_app(&store).await;
+        app.armed = false;
+        app.execute_suggestion(&sell_put(1), &store).await.unwrap();
+        assert!(app.status.contains("disarmed"), "status: {}", app.status);
+        assert!(store.recent_journal(10).await.unwrap().is_empty(), "nothing journaled");
+    }
+
+    #[tokio::test]
+    async fn execute_blocked_when_read_only() {
+        let store = Store::open_in_memory().await.unwrap();
+        let mut app = offline_app(&store).await;
+        app.armed = true;
+        app.cfg.guardrails.read_only = true;
+        app.execute_suggestion(&sell_put(1), &store).await.unwrap();
+        assert!(app.status.contains("read_only"), "status: {}", app.status);
+        assert!(store.recent_journal(10).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn execute_blocked_when_quantity_exceeds_max() {
+        let store = Store::open_in_memory().await.unwrap();
+        let mut app = offline_app(&store).await;
+        app.armed = true;
+        app.cfg.guardrails.read_only = false;
+        app.cfg.guardrails.max_contracts_per_order = 2;
+        app.execute_suggestion(&sell_put(5), &store).await.unwrap();
+        assert!(
+            app.status.contains("exceeds max_contracts_per_order"),
+            "status: {}",
+            app.status
+        );
+        assert!(store.recent_journal(10).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn execute_passes_guards_then_halts_without_connection() {
+        // Armed + not read-only + within the contract cap → all guards pass; with
+        // no broker it must halt at the connection check (proving the guards did
+        // NOT block it, and that nothing transmits offline).
+        let store = Store::open_in_memory().await.unwrap();
+        let mut app = offline_app(&store).await;
+        app.armed = true;
+        app.cfg.guardrails.read_only = false;
+        app.cfg.guardrails.max_contracts_per_order = 10;
+        app.execute_suggestion(&sell_put(1), &store).await.unwrap();
+        assert!(app.status.contains("not connected"), "status: {}", app.status);
+        assert!(store.recent_journal(10).await.unwrap().is_empty());
+    }
+
+    // --- order-event → journal transitions (the fill/cancel tracking path) ---
+
+    #[tokio::test]
+    async fn fill_event_transitions_journal_to_filled() {
+        let store = Store::open_in_memory().await.unwrap();
+        let mut app = offline_app(&store).await;
+        seed_submitted(&store, "AAPL", "42").await;
+        app.apply_order_event(status_event(42, "Filled", 1.0, 1.85), &store)
+            .await
+            .unwrap();
+        let row = store
+            .recent_journal(10)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|j| j.ibkr_order_id.as_deref() == Some("42"))
+            .unwrap();
+        assert_eq!(row.status, "filled");
+        assert_eq!(row.note.as_deref(), Some("filled 1 @ 1.85"));
+        assert!(app.status.contains("filled"), "status: {}", app.status);
+    }
+
+    #[tokio::test]
+    async fn cancel_event_transitions_journal_to_cancelled() {
+        let store = Store::open_in_memory().await.unwrap();
+        let mut app = offline_app(&store).await;
+        seed_submitted(&store, "AAPL", "7").await;
+        app.apply_order_event(status_event(7, "Cancelled", 0.0, 0.0), &store)
+            .await
+            .unwrap();
+        let row = store.recent_journal(10).await.unwrap().into_iter().next().unwrap();
+        assert_eq!(row.status, "cancelled");
+    }
+
+    #[tokio::test]
+    async fn inactive_event_is_recorded_as_rejected() {
+        let store = Store::open_in_memory().await.unwrap();
+        let mut app = offline_app(&store).await;
+        seed_submitted(&store, "AAPL", "9").await;
+        app.apply_order_event(status_event(9, "Inactive", 0.0, 0.0), &store)
+            .await
+            .unwrap();
+        assert_eq!(store.recent_journal(10).await.unwrap()[0].status, "rejected");
+    }
+
+    #[tokio::test]
+    async fn event_for_foreign_order_leaves_journal_untouched() {
+        let store = Store::open_in_memory().await.unwrap();
+        let mut app = offline_app(&store).await;
+        seed_submitted(&store, "AAPL", "42").await;
+        // A fill for an order id we never placed (e.g. placed directly in TWS).
+        app.apply_order_event(status_event(999, "Filled", 1.0, 2.0), &store)
+            .await
+            .unwrap();
+        assert_eq!(store.recent_journal(10).await.unwrap()[0].status, "submitted");
+    }
+
+    #[tokio::test]
+    async fn working_ack_with_no_fill_is_ignored() {
+        let store = Store::open_in_memory().await.unwrap();
+        let mut app = offline_app(&store).await;
+        seed_submitted(&store, "AAPL", "42").await;
+        // A plain Submitted ack (working, nothing filled) must not change anything.
+        app.apply_order_event(status_event(42, "Submitted", 0.0, 0.0), &store)
+            .await
+            .unwrap();
+        assert_eq!(store.recent_journal(10).await.unwrap()[0].status, "submitted");
+    }
+
+    #[tokio::test]
+    async fn notice_event_surfaces_on_status_line() {
+        let store = Store::open_in_memory().await.unwrap();
+        let mut app = offline_app(&store).await;
+        app.apply_order_event(OrderEvent::Notice("heads up".into()), &store)
+            .await
+            .unwrap();
+        assert!(app.status.contains("broker: heads up"), "status: {}", app.status);
+    }
+
+    // --- pending-roll lifecycle ---
+
+    #[tokio::test]
+    async fn filled_close_completes_pending_roll_and_keeps_record_on_offline_open() {
+        let store = Store::open_in_memory().await.unwrap();
+        let mut app = offline_app(&store).await;
+        seed_submitted(&store, "AAPL", "50").await;
+        store.add_pending_roll(&pending("50", false).to_row()).await.unwrap();
+        app.pending_rolls.push(pending("50", false));
+
+        app.apply_order_event(status_event(50, "Filled", 1.0, 5.0), &store)
+            .await
+            .unwrap();
+
+        // Matched and removed from memory; offline open can't transmit, so the
+        // persisted row is retained for a later retry.
+        assert!(app.pending_rolls.is_empty(), "in-memory pending roll cleared");
+        assert_eq!(store.list_pending_rolls().await.unwrap().len(), 1, "persisted for retry");
+        assert!(app.status.contains("not connected"), "status: {}", app.status);
+    }
+
+    #[tokio::test]
+    async fn cancelled_close_abandons_pending_roll() {
+        let store = Store::open_in_memory().await.unwrap();
+        let mut app = offline_app(&store).await;
+        seed_submitted(&store, "AAPL", "60").await;
+        store.add_pending_roll(&pending("60", false).to_row()).await.unwrap();
+        app.pending_rolls.push(pending("60", false));
+
+        app.apply_order_event(status_event(60, "Cancelled", 0.0, 0.0), &store)
+            .await
+            .unwrap();
+
+        assert!(app.pending_rolls.is_empty());
+        assert!(store.list_pending_rolls().await.unwrap().is_empty(), "persisted roll dropped");
+        assert!(app.status.contains("not opened"), "status: {}", app.status);
+    }
+
+    #[tokio::test]
+    async fn is_symbol_blocked_reads_watchlist() {
+        let store = Store::open_in_memory().await.unwrap();
+        let mut app = offline_app(&store).await;
+        app.watchlist = vec![
+            watch_row("AAPL", Some(0)), // blocked
+            watch_row("MSFT", Some(1)), // allowed
+            watch_row("TSLA", None),    // unknown
+        ];
+        assert!(app.is_symbol_blocked("AAPL"));
+        assert!(!app.is_symbol_blocked("MSFT"));
+        assert!(!app.is_symbol_blocked("TSLA"));
+        assert!(!app.is_symbol_blocked("NVDA")); // not on the list
+    }
+
+    #[tokio::test]
+    async fn open_position_count_ignores_idle_and_unknown_states() {
+        let store = Store::open_in_memory().await.unwrap();
+        store.upsert_wheel_state("AAPL", "ShortPut", 0, 0.0).await.unwrap();
+        store.upsert_wheel_state("MSFT", "Idle", 0, 0.0).await.unwrap();
+        store.upsert_wheel_state("NVDA", "garbage", 0, 0.0).await.unwrap(); // unknown → Idle
+        let app = offline_app(&store).await;
+        assert_eq!(app.open_position_count(), 1, "only the ShortPut counts as open");
+    }
+
+    // --- broker-positions → wheel-state store sync (Phase 1 core) ---
+
+    fn short_put_pos(symbol: &str) -> PositionRow {
+        PositionRow {
+            account: "DU".into(),
+            symbol: symbol.into(),
+            security_type: "Option".into(),
+            right: "P".into(),
+            strike: 90.0,
+            expiry: "20260116".into(),
+            position: -1.0,
+            average_cost: 150.0,
+            multiplier: "100".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn sync_wheel_state_persists_reconciled_leg() {
+        let store = Store::open_in_memory().await.unwrap();
+        sync_wheel_state(&store, &[short_put_pos("AAPL")]).await;
+        let row = store
+            .list_positions()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|r| r.symbol == "AAPL")
+            .expect("AAPL synced");
+        assert_eq!(row.state, "ShortPut");
+    }
+
+    #[tokio::test]
+    async fn sync_wheel_state_closes_vanished_position_but_keeps_premium() {
+        let store = Store::open_in_memory().await.unwrap();
+        // A previously-tracked short put with collected premium.
+        store
+            .upsert_position(&WheelPositionRow {
+                symbol: "AAPL".into(),
+                state: "ShortPut".into(),
+                shares: 0,
+                cost_basis: 0.0,
+                cumulative_premium: 1.50,
+                updated_at: String::new(),
+            })
+            .await
+            .unwrap();
+        // No broker positions anymore → the leg is closed (Idle)…
+        sync_wheel_state(&store, &[]).await;
+        let row = store
+            .list_positions()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|r| r.symbol == "AAPL")
+            .unwrap();
+        assert_eq!(row.state, "Idle");
+        // …but the locally-tracked premium is preserved (broker can't report it).
+        assert!((row.cumulative_premium - 1.50).abs() < 1e-9);
+    }
+
     #[test]
     fn journal_status_mapping() {
         assert_eq!(journal_status_for("Filled"), Some("filled"));

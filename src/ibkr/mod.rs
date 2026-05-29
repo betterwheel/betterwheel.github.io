@@ -29,6 +29,7 @@ pub struct Ibkr {
 impl Ibkr {
     /// Connect to the configured Gateway and apply the market-data preference.
     pub async fn connect(cfg: &ConnectionConfig) -> Result<Self> {
+        register_locale_timezone_aliases();
         let addr = cfg.address();
         let client = Client::connect(&addr, cfg.client_id)
             .await
@@ -223,13 +224,18 @@ impl Ibkr {
         limit: f64,
     ) -> Result<OrderState> {
         let contract = Contract::option(symbol, expiry_yyyymmdd, strike, "P");
-        self.client
+        let analyze = self
+            .client
             .order(&contract)
             .sell(quantity)
             .limit(limit)
             .day_order()
-            .analyze()
+            .analyze();
+        // Bound the what-if (never transmits): a read-only Gateway can otherwise
+        // leave it pending forever, so a timeout surfaces as a clear Blocked.
+        timeout(Duration::from_secs(10), analyze)
             .await
+            .map_err(|_| anyhow!("what-if timed out (Gateway API may be read-only)"))?
             .map_err(|e| anyhow!("what-if analyze: {e}"))
     }
 
@@ -260,9 +266,11 @@ impl Ibkr {
         };
         let ready = sided.limit(order.limit).day_order();
         if preview {
-            let state = ready
-                .analyze()
+            // Bound the what-if: it never transmits, and a read-only Gateway can
+            // otherwise leave `analyze()` pending indefinitely.
+            let state = timeout(Duration::from_secs(10), ready.analyze())
                 .await
+                .map_err(|_| anyhow!("preview {order}: timed out (is the Gateway API read-only?)"))?
                 .map_err(|e| anyhow!("preview {order}: {e}"))?;
             Ok(OrderOutcome::Preview(Box::new(state)))
         } else {
@@ -323,21 +331,27 @@ impl Ibkr {
         }
     }
 
-    /// Collect a one-shot market-data snapshot for a contract.
+    /// Collect a market-data snapshot for a contract.
+    ///
+    /// IBKR rejects a *snapshot* that also requests generic ticks (e.g. option
+    /// greeks via tick 106) — "snapshot not applicable to generic ticks" — so for
+    /// greeks we open a brief *streaming* subscription and stop as soon as the
+    /// first option computation arrives. Price-only requests (no generic ticks,
+    /// e.g. the underlying) use a cheaper one-shot snapshot.
     async fn collect_snapshot(
         &self,
         contract: &Contract,
         generic_ticks: &[&str],
         wait: Duration,
     ) -> Result<SnapshotData> {
-        let mut sub = self
-            .client
-            .market_data(contract)
-            .generic_ticks(generic_ticks)
-            .snapshot()
-            .subscribe()
-            .await
-            .map_err(|e| anyhow!("market_data subscribe: {e}"))?;
+        let wants_greeks = !generic_ticks.is_empty();
+        let builder = self.client.market_data(contract).generic_ticks(generic_ticks);
+        let mut sub = if wants_greeks {
+            builder.subscribe().await
+        } else {
+            builder.snapshot().subscribe().await
+        }
+        .map_err(|e| anyhow!("market_data subscribe: {e}"))?;
 
         let mut data = SnapshotData::default();
         let _ = timeout(wait, async {
@@ -360,11 +374,35 @@ impl Ibkr {
                         break;
                     }
                 }
+                // Streaming has no end marker — stop as soon as we have what we
+                // came for (a computation for greeks, else a price) instead of
+                // waiting out the full timeout on every contract.
+                let enough = if wants_greeks { data.comp.is_some() } else { data.last.is_some() };
+                if enough {
+                    break;
+                }
             }
         })
         .await;
+        // Dropping `sub` cancels any streaming subscription.
         Ok(data)
     }
+}
+
+/// IB Gateway reports its timezone using the OS locale's *display name*, but
+/// `ibapi` only recognizes English/IANA names — so a non-English Gateway fails
+/// the handshake with "unrecognized IB Gateway timezone". Register the localized
+/// Central-European names we've encountered (Italian) so connecting works
+/// regardless of Gateway language. Registration is process-wide and idempotent.
+///
+/// `Europe/Rome` is CET/CEST (UTC+1 / +2 with EU DST) — identical offsets to the
+/// crate's built-in `Central European Standard Time` mapping. Alternatives:
+/// set `IBAPI_TIMEZONE_ALIASES`, or switch the Gateway UI to English.
+fn register_locale_timezone_aliases() {
+    // Italian: "Central European {Standard,Summer} Time". The apostrophe is a
+    // curly U+2019 (’), exactly as the Gateway sends it.
+    ibapi::register_timezone_alias("Ora standard dell’Europa centrale", "Europe/Rome");
+    ibapi::register_timezone_alias("Ora legale dell’Europa centrale", "Europe/Rome");
 }
 
 /// Parsed account balances (each `None` until reported).

@@ -320,4 +320,43 @@ mod tests {
         let r = reconcile("AAPL", &rows);
         assert_eq!(r.state, WheelState::Idle);
     }
+
+    #[test]
+    fn multiple_long_lots_use_share_weighted_cost_basis() {
+        // 100 @ $90 + 100 @ $110 → 200 shares, weighted basis $100.
+        let rows = vec![stock("AAPL", 100.0, 90.0), stock("AAPL", 100.0, 110.0)];
+        let r = reconcile("AAPL", &rows);
+        assert_eq!(r.state, WheelState::LongShares);
+        let lot = r.shares.expect("lot");
+        assert_eq!(lot.shares, 200);
+        assert!((lot.cost_basis - 100.0).abs() < 1e-9, "basis {}", lot.cost_basis);
+    }
+
+    #[test]
+    fn short_stock_is_not_a_coverable_lot() {
+        // The wheel never shorts stock; a negative net must not become a lot.
+        let rows = vec![stock("AAPL", -100.0, 90.0)];
+        let r = reconcile("AAPL", &rows);
+        assert_eq!(r.state, WheelState::Idle);
+        assert!(r.shares.is_none());
+    }
+
+    #[test]
+    fn missing_or_zero_multiplier_defaults_to_100() {
+        // average_cost 250 with no multiplier → per-share credit 250/100 = 2.50.
+        let mut empty = option("MSFT", "P", 400.0, "20260116", -1.0, 250.0);
+        empty.multiplier = String::new();
+        assert!((reconcile("MSFT", &[empty]).open_short.unwrap().entry_credit - 2.50).abs() < 1e-9);
+
+        let mut zero = option("MSFT", "P", 400.0, "20260116", -1.0, 250.0);
+        zero.multiplier = "0".into(); // never divide by zero
+        assert!((reconcile("MSFT", &[zero]).open_short.unwrap().entry_credit - 2.50).abs() < 1e-9);
+    }
+
+    #[test]
+    fn multi_contract_short_put_reports_quantity() {
+        let rows = vec![option("AAPL", "P", 90.0, "20260116", -3.0, 90.0)];
+        let r = reconcile("AAPL", &rows);
+        assert_eq!(r.open_short.expect("short").quantity, 3);
+    }
 }
