@@ -329,16 +329,24 @@ fn downside_scenarios(
     let dim = Style::new().fg(Color::DarkGray);
     let good = Style::new().fg(Color::Green);
     let bad = Style::new().fg(Color::Red);
-    let mut out = vec![Line::styled(
-        "  If the stock falls, your P&L at expiry:".to_string(),
-        dim,
-    )];
+    // Header anchors the drops to the *current* price and how far the strike sits
+    // below it — without that, a −10% row that still keeps the credit reads as
+    // impossible (the strike is already well below today's price).
+    let header = if short_strike < spot {
+        let pct_below = (spot - short_strike) / spot * 100.0;
+        format!("  Stock ${spot:.2} now — the ${short_strike:.1} strike is {pct_below:.0}% below:")
+    } else {
+        "  If the stock falls, your P&L at expiry:".to_string()
+    };
+    let mut out = vec![Line::styled(header, dim)];
     for mv in [0.05f64, 0.10, 0.20, 0.30, 0.40] {
         let s_t = spot * (1.0 - mv);
         let pnl = short_put_pnl_at(s_t, short_strike, credit, long_strike, shares);
         let (style, sign) = if pnl >= 0.0 { (good, "+") } else { (bad, "−") };
+        // Tag the rows that never reach the strike — that's *why* the credit is kept.
+        let tag = if s_t >= short_strike { "   · above strike" } else { "" };
         out.push(Line::styled(
-            format!("    −{:>2.0}%  →  ${s_t:>8.2}   {sign}${:>9.0}", mv * 100.0, pnl.abs()),
+            format!("    −{:>2.0}%  →  ${s_t:>8.2}   {sign}${:>9.0}{tag}", mv * 100.0, pnl.abs()),
             style,
         ));
     }
