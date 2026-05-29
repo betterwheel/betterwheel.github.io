@@ -7,6 +7,7 @@
 
 pub mod app;
 pub mod demo;
+mod live;
 pub mod ui;
 
 use std::sync::Arc;
