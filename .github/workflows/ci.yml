@@ -22,8 +22,10 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - name: clippy
-        run: cargo clippy --all-targets
+      # Lint is mandatory: any warning (rustc or clippy) fails the job, and the
+      # build/release jobs depend on it, so nothing ships with a lint error.
+      - name: clippy (deny all warnings)
+        run: cargo clippy --all-targets --all-features -- -D warnings
       - name: test
         run: cargo test
 
