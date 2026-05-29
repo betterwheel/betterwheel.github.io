@@ -72,6 +72,13 @@ Data flow when connected: `ibkr.positions()` → `positions::reconcile` → sync
   usable. `App.connected` / `ibkr: Option` gate all live paths.
 - **Greeks may be missing** (paper accounts, illiquid strikes): the engine falls
   back to `math::bs_delta` from implied volatility to filter by moneyness.
+- **Live market data needs IBKR web-portal setup first.** Even connected on
+  paper, the API returns no option prices/greeks — codes `10091`/`10167`, so the
+  Suggestions tab stays empty — until you complete, in the IBKR web portal
+  (Client Portal): the **"Market Data API access configuration"**, the
+  **"Non-Commercial Form"**, and your **Market Data Subscriber Status**, *and*
+  hold the actual subscription (OPRA for US options). The app connects fine
+  without these; it just can't rank anything. Offline/demo mode is unaffected.
 - IBKR right strings vary (`P`/`PUT`/`C`/`CALL`); option `average_cost` includes
   the contract multiplier, so per-share credit = `average_cost / multiplier`
   (see `positions.rs`). Expiries are `YYYYMMDD`; contract-month-only expiries are
