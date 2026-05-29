@@ -4,7 +4,7 @@ use ratatui::prelude::*;
 use ratatui::widgets::{Block, Cell, Paragraph, Row, Table, Tabs, Wrap};
 
 use super::app::{App, InputMode, Tab};
-use crate::engine::types::{ActionKind, Right, Suggestion};
+use crate::engine::types::{ActionKind, Suggestion};
 
 const SEL: Style = Style::new().fg(Color::Black).bg(Color::Cyan);
 const HEAD: Style = Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD);
@@ -27,10 +27,21 @@ pub fn render(frame: &mut Frame, app: &App) {
 
 fn render_tabs(frame: &mut Frame, app: &App, area: Rect) {
     let titles = Tab::ALL.iter().map(|t| Line::from(format!(" {} ", t.title())));
-    let badge = if app.connected { "● live" } else { "○ offline" };
+    let conn = if app.connected { "● live" } else { "○ offline" };
+    let armed = if app.armed { "  ⚡ ARMED" } else { "" };
+    let title = format!(
+        "TheWheel  [{}]  {conn}  ·  {} open{armed}",
+        app.mode_label(),
+        app.open_position_count()
+    );
+    let mut block = Block::bordered().title(title);
+    if app.armed {
+        // A loud, hard-to-miss cue that `x` will transmit a live order.
+        block = block.border_style(Style::new().fg(Color::Red).add_modifier(Modifier::BOLD));
+    }
     let tabs = Tabs::new(titles)
         .select(app.tab.index())
-        .block(Block::bordered().title(format!("TheWheel  [{}]  {badge}", app.mode_label())))
+        .block(block)
         .highlight_style(SEL.add_modifier(Modifier::BOLD));
     frame.render_widget(tabs, area);
 }
@@ -57,7 +68,15 @@ fn render_dashboard(frame: &mut Frame, app: &App, area: Rect) {
             money(a.total_cash),
             money(a.buying_power)
         ),
-        None => "—  (offline; configure OAuth in config.toml to connect — see SETUP.md)".into(),
+        None => "—  (offline; start IB Gateway/TWS and set [connection] in config.toml)".into(),
+    };
+    let armed = if app.armed {
+        Span::styled(
+            "ARMED — `x` transmits a live order",
+            Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )
+    } else {
+        Span::styled("disarmed (`A` to arm)", Style::new().fg(Color::DarkGray))
     };
     let lines = vec![
         Line::from(vec![
@@ -67,6 +86,7 @@ fn render_dashboard(frame: &mut Frame, app: &App, area: Rect) {
             Span::raw(if app.connected { "live" } else { "offline / demo data" }),
         ]),
         Line::from(vec![Span::styled("Account:     ", HEAD), Span::raw(acct)]),
+        Line::from(vec![Span::styled("Armed:       ", HEAD), armed]),
         Line::from(""),
         Line::from(vec![
             Span::styled("Watchlist:   ", HEAD),
@@ -78,7 +98,11 @@ fn render_dashboard(frame: &mut Frame, app: &App, area: Rect) {
         ]),
         Line::from(vec![
             Span::styled("Positions:   ", HEAD),
-            Span::raw(format!("{} tracked", app.positions.len())),
+            Span::raw(format!(
+                "{} open / {} tracked",
+                app.open_position_count(),
+                app.positions.len()
+            )),
         ]),
         Line::from(""),
         Line::from(Span::styled(
@@ -194,12 +218,17 @@ fn render_help(frame: &mut Frame, area: Rect) {
         Line::from("  a                add a symbol (type ticker, Enter)"),
         Line::from("  d                delete selected symbol"),
         Line::from(""),
+        Line::from(Span::styled("Trading (Suggestions tab)", HEAD)),
+        Line::from("  p                preview (what-if): margin / commission, no transmit"),
+        Line::from("  A                arm / disarm — while armed, `x` sends a LIVE order"),
+        Line::from("  x                execute the selected suggestion (needs arm + not read_only)"),
+        Line::from(""),
         Line::from(Span::styled("General", HEAD)),
         Line::from("  r                refresh / recompute suggestions"),
         Line::from("  q  or  Ctrl-C    quit"),
         Line::from(""),
         Line::from(Span::styled(
-            "Offline mode shows demo data. Start IB Gateway and configure config.toml to go live.",
+            "Offline mode shows demo data. Start IB Gateway and set [connection] in config.toml to go live.",
             Style::new().fg(Color::DarkGray),
         )),
     ];
@@ -233,14 +262,6 @@ fn action_label(k: &ActionKind) -> &'static str {
         ActionKind::SellCall => "Sell Call",
         ActionKind::CloseForProfit => "Close",
         ActionKind::Roll { .. } => "Roll",
-    }
-}
-
-#[allow(dead_code)]
-fn right_label(r: Right) -> &'static str {
-    match r {
-        Right::Put => "P",
-        Right::Call => "C",
     }
 }
 

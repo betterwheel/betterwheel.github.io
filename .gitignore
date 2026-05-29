@@ -1,9 +1,13 @@
 # Build artifacts
 /target
 
-# Secrets — NEVER commit these
-/config.toml          # your real config (may hold account id / OAuth ids)
-*.pem                 # RSA private/public keys
+# Secrets — NEVER commit these.
+# NOTE: .gitignore has no inline comments — text after a pattern on the same
+# line becomes part of the pattern, so keep comments on their own lines.
+# your real config (may hold account id / OAuth ids)
+/config.toml
+# RSA private/public keys
+*.pem
 *.key
 private_key*
 public_key*

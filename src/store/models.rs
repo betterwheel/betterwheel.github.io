@@ -60,6 +60,24 @@ pub struct JournalRow {
     pub note: Option<String>,
 }
 
+/// A roll awaiting its buy-to-close leg to fill before the sell-to-open leg is
+/// transmitted. Persisted so the roll survives a restart (see `pending_rolls`).
+#[derive(Debug, Clone, FromRow)]
+pub struct PendingRollRow {
+    pub close_oid: String,
+    pub symbol: String,
+    pub right: String,
+    /// The near (closing) leg — used on restart to tell a filled close (short
+    /// gone from positions) from a cancelled one (short still held).
+    pub near_strike: f64,
+    pub near_expiry: String,
+    pub to_strike: f64,
+    pub to_expiry: String,
+    pub quantity: i64,
+    pub far_limit: f64,
+    pub created_at: String,
+}
+
 /// Fields for a new journal entry (id/ts are assigned on insert).
 #[derive(Debug, Clone, Default)]
 pub struct NewJournalEntry {

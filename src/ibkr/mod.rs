@@ -10,11 +10,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
+use tokio::sync::mpsc;
 use tokio::time::timeout;
 
 use ibapi::accounts::types::AccountGroup;
 use ibapi::contracts::{OptionChain, OptionComputation};
-use ibapi::orders::OrderState;
+use ibapi::orders::{OrderState, Orders};
 use ibapi::prelude::*;
 
 use crate::config::{ConnectionConfig, MarketDataPref};
@@ -81,6 +82,12 @@ impl Ibkr {
     }
 
     /// All open positions in the account.
+    ///
+    /// Returns `Err` if the snapshot is *incomplete* (stream error or timeout
+    /// before the `PositionEnd` marker) so callers can tell "the account holds
+    /// nothing" (`Ok(vec![])`) apart from "we failed to read positions". This
+    /// distinction is safety-critical: the wheel-state sync must never treat a
+    /// failed fetch as "all positions closed".
     pub async fn positions(&self) -> Result<Vec<PositionRow>> {
         let mut sub = self
             .client
@@ -89,17 +96,61 @@ impl Ibkr {
             .map_err(|e| anyhow!("positions: {e}"))?;
 
         let mut rows = Vec::new();
-        let _ = timeout(Duration::from_secs(8), async {
+        let completed = timeout(Duration::from_secs(8), async {
             while let Some(item) = sub.next().await {
                 match item {
                     Ok(PositionUpdate::Position(p)) => rows.push(PositionRow::from(&p)),
-                    Ok(PositionUpdate::PositionEnd) => break,
-                    Err(_) => break,
+                    Ok(PositionUpdate::PositionEnd) => return true,
+                    Err(_) => return false,
+                }
+            }
+            false // stream closed before PositionEnd
+        })
+        .await;
+        match completed {
+            Ok(true) => Ok(rows),
+            Ok(false) => Err(anyhow!("positions stream ended before completion")),
+            Err(_) => Err(anyhow!("positions request timed out")),
+        }
+    }
+
+    /// Snapshot of this client's currently open orders (id + underlying symbol).
+    ///
+    /// Authoritative "what's working right now": used to suppress stacking a
+    /// second action on a symbol with a live order, and to reconcile pending
+    /// rolls after a restart. `Err` on a timed-out snapshot so callers can fall
+    /// back rather than treat "unknown" as "nothing open".
+    pub async fn open_orders_snapshot(&self) -> Result<Vec<OpenOrderInfo>> {
+        let mut sub = self
+            .client
+            .open_orders()
+            .await
+            .map_err(|e| anyhow!("open_orders: {e}"))?;
+
+        let mut out = Vec::new();
+        // The crate signals `OpenOrderEnd` by ending the stream (`next()` →
+        // `None`); a `Some(Err(..))` is therefore a genuine mid-snapshot error.
+        // Return `Err` for any incomplete result (error or timeout) so callers
+        // fall back rather than treat a partial list as authoritative.
+        let outcome = timeout(Duration::from_secs(8), async {
+            loop {
+                match sub.next().await {
+                    Some(Ok(Orders::OrderData(d))) => out.push(OpenOrderInfo {
+                        order_id: d.order_id.to_string(),
+                        symbol: d.contract.symbol.to_string(),
+                    }),
+                    Some(Ok(_)) => {} // OrderStatus / Notice — not needed here
+                    Some(Err(e)) => return Err(anyhow!("open_orders stream error: {e}")),
+                    None => return Ok(()), // clean end (OpenOrderEnd)
                 }
             }
         })
         .await;
-        Ok(rows)
+        match outcome {
+            Ok(Ok(())) => Ok(out),
+            Ok(Err(e)) => Err(e),
+            Err(_) => Err(anyhow!("open_orders request timed out")),
+        }
     }
 
     /// Resolve the underlying's IBKR contract id (needed for the option chain).
@@ -193,38 +244,82 @@ impl Ibkr {
         }
     }
 
-    /// Submit (transmit) or preview (what-if) an option order. A single entry
-    /// point so the TUI's preview/execute paths can't drift apart.
+    /// Submit (transmit) or preview (what-if) a single-leg option order. A
+    /// single entry point so the TUI's preview/execute paths can't drift apart.
     pub async fn submit_or_preview(
         &self,
-        symbol: &str,
-        expiry_yyyymmdd: &str,
-        strike: f64,
-        right: &str,
-        side: Side,
-        quantity: i32,
-        limit: f64,
+        order: &OptionOrder<'_>,
         preview: bool,
     ) -> Result<OrderOutcome> {
-        let contract = Contract::option(symbol, expiry_yyyymmdd, strike, right);
+        let contract =
+            Contract::option(order.symbol, order.expiry_yyyymmdd, order.strike, order.right);
         let builder = self.client.order(&contract);
-        let sided = match side {
-            Side::Buy => builder.buy(quantity),
-            Side::Sell => builder.sell(quantity),
+        let sided = match order.side {
+            Side::Buy => builder.buy(order.quantity),
+            Side::Sell => builder.sell(order.quantity),
         };
-        let ready = sided.limit(limit).day_order();
+        let ready = sided.limit(order.limit).day_order();
         if preview {
             let state = ready
                 .analyze()
                 .await
-                .map_err(|e| anyhow!("preview {symbol} {strike}{right}@{limit}: {e}"))?;
-            Ok(OrderOutcome::Preview(state))
+                .map_err(|e| anyhow!("preview {order}: {e}"))?;
+            Ok(OrderOutcome::Preview(Box::new(state)))
         } else {
             let id = ready
                 .submit()
                 .await
-                .map_err(|e| anyhow!("submit {symbol} {strike}{right}@{limit}: {e}"))?;
-            Ok(OrderOutcome::Submitted(format!("{id:?}")))
+                .map_err(|e| anyhow!("submit {order}: {e}"))?;
+            // Store the bare numeric id so it matches `OrderStatus.order_id`
+            // from the update stream (see `stream_order_events`).
+            Ok(OrderOutcome::Submitted(id.0.to_string()))
+        }
+    }
+
+    /// Consume the account-wide order-activity stream, forwarding each update as
+    /// a plain [`OrderEvent`] over `tx`. Runs until the receiver is dropped.
+    ///
+    /// The crate auto-reconnects the socket but does *not* auto-resubscribe, so
+    /// on a stream end we drop the subscription and resubscribe after a short
+    /// pause. Returns when `tx` is closed (UI gone) or a fresh subscription
+    /// cannot be established.
+    pub async fn stream_order_events(&self, tx: mpsc::UnboundedSender<OrderEvent>) {
+        loop {
+            match self.client.order_update_stream().await {
+                Ok(mut sub) => {
+                    while let Some(item) = sub.next().await {
+                        match item {
+                            Ok(update) => {
+                                if let Some(ev) = map_order_update(update)
+                                    && tx.send(ev).is_err()
+                                {
+                                    return; // receiver dropped — UI is gone
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!("order stream error: {e}");
+                                break;
+                            }
+                        }
+                    }
+                    // Stream ended; `sub` drops here, releasing the subscription
+                    // before we resubscribe below.
+                }
+                Err(e) => {
+                    // A (re)subscribe failure must NOT permanently kill event
+                    // delivery — the Gateway may be briefly restarting. Notify,
+                    // back off, and retry rather than returning.
+                    tracing::warn!("order stream subscribe failed: {e}");
+                    let _ = tx.send(OrderEvent::Notice(format!("order stream reconnecting: {e}")));
+                }
+            }
+            if tx.is_closed() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            if tx.is_closed() {
+                return;
+            }
         }
     }
 
@@ -301,12 +396,16 @@ impl AccountSnapshot {
 pub struct PositionRow {
     pub account: String,
     pub symbol: String,
+    /// Debug spelling of the `ibapi` security type, e.g. `"Stock"` / `"Option"`.
     pub security_type: String,
     pub right: String,
     pub strike: f64,
     pub expiry: String,
     pub position: f64,
     pub average_cost: f64,
+    /// Contract multiplier as IBKR reports it (e.g. `"100"` for an equity
+    /// option); empty for stock. Needed to recover per-share option premium.
+    pub multiplier: String,
 }
 
 impl From<&ibapi::accounts::Position> for PositionRow {
@@ -320,6 +419,7 @@ impl From<&ibapi::accounts::Position> for PositionRow {
             expiry: p.contract.last_trade_date_or_contract_month.clone(),
             position: p.position,
             average_cost: p.average_cost,
+            multiplier: p.contract.multiplier.clone(),
         }
     }
 }
@@ -373,11 +473,90 @@ pub enum Side {
     Sell,
 }
 
+impl std::fmt::Display for Side {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Side::Buy => "BUY",
+            Side::Sell => "SELL",
+        })
+    }
+}
+
+/// A single-leg option order request (preview or live). Borrows its strings so
+/// callers can build one cheaply from a [`crate::engine::Suggestion`].
+#[derive(Debug, Clone, Copy)]
+pub struct OptionOrder<'a> {
+    pub symbol: &'a str,
+    /// Expiry as `YYYYMMDD`.
+    pub expiry_yyyymmdd: &'a str,
+    pub strike: f64,
+    /// IBKR right code: `"P"` or `"C"`.
+    pub right: &'a str,
+    pub side: Side,
+    pub quantity: i32,
+    /// Limit price (premium per share).
+    pub limit: f64,
+}
+
+impl std::fmt::Display for OptionOrder<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} {}x {} {:.1}{} {} @{:.2}",
+            self.side, self.quantity, self.symbol, self.strike, self.right, self.expiry_yyyymmdd, self.limit
+        )
+    }
+}
+
+/// One of the account's currently open orders (id + underlying symbol).
+#[derive(Debug, Clone)]
+pub struct OpenOrderInfo {
+    pub order_id: String,
+    pub symbol: String,
+}
+
+/// A plain, broker-agnostic order-activity event mapped from `ibapi`'s
+/// `OrderUpdate`. Only the variants the wheel app acts on are carried.
+#[derive(Debug, Clone)]
+pub enum OrderEvent {
+    /// A status transition for an order, keyed by its numeric id (matches the
+    /// id stored on submission). `status` is IBKR's raw status string.
+    Status {
+        order_id: i32,
+        status: String,
+        filled: f64,
+        remaining: f64,
+        avg_fill_price: f64,
+    },
+    /// A notice or error message from the order subsystem.
+    Notice(String),
+}
+
+/// Map an `ibapi` order update into an [`OrderEvent`], or `None` for updates the
+/// app doesn't act on (open-order snapshots, executions, commission reports —
+/// fills are already conveyed by `OrderStatus`).
+fn map_order_update(update: ibapi::orders::OrderUpdate) -> Option<OrderEvent> {
+    use ibapi::orders::OrderUpdate;
+    match update {
+        OrderUpdate::OrderStatus(s) => Some(OrderEvent::Status {
+            order_id: s.order_id,
+            status: s.status,
+            filled: s.filled,
+            remaining: s.remaining,
+            avg_fill_price: s.average_fill_price,
+        }),
+        OrderUpdate::Message(n) => Some(OrderEvent::Notice(format!("{n:?}"))),
+        OrderUpdate::OpenOrder(_)
+        | OrderUpdate::ExecutionData(_)
+        | OrderUpdate::CommissionReport(_) => None,
+    }
+}
+
 /// Result of [`Ibkr::submit_or_preview`].
 #[derive(Debug)]
 pub enum OrderOutcome {
-    /// What-if margin / commission impact.
-    Preview(OrderState),
+    /// What-if margin / commission impact. Boxed: `OrderState` is large.
+    Preview(Box<OrderState>),
     /// Live submission succeeded; carries the IBKR order id (formatted).
     Submitted(String),
 }

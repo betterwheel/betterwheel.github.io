@@ -52,20 +52,11 @@ pub struct UnderlyingQuote {
     pub last: f64,
 }
 
-/// Account capital snapshot used for position sizing.
-#[derive(Debug, Clone, Copy)]
-pub struct AccountState {
-    pub net_liquidation: f64,
-    /// Funds available to secure new cash-secured puts.
-    pub available_funds: f64,
-    /// Capital already committed by the app to open wheel positions.
-    pub deployed: f64,
-}
-
 /// The wheel leg a symbol is currently in.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum WheelState {
     /// No position — eligible to sell a cash-secured put.
+    #[default]
     Idle,
     /// A short cash-secured put is open.
     ShortPut,
@@ -75,8 +66,30 @@ pub enum WheelState {
     ShortCall,
 }
 
+impl WheelState {
+    /// Stable string used for persistence and display.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            WheelState::Idle => "Idle",
+            WheelState::ShortPut => "ShortPut",
+            WheelState::LongShares => "LongShares",
+            WheelState::ShortCall => "ShortCall",
+        }
+    }
+
+    /// Parse a persisted state string, falling back to [`WheelState::Idle`].
+    pub fn parse(s: &str) -> WheelState {
+        match s {
+            "ShortPut" => WheelState::ShortPut,
+            "LongShares" => WheelState::LongShares,
+            "ShortCall" => WheelState::ShortCall,
+            _ => WheelState::Idle,
+        }
+    }
+}
+
 /// An open short option we already hold (used by the management logic).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct OpenShortOption {
     pub right: Right,
     pub strike: f64,
@@ -88,7 +101,7 @@ pub struct OpenShortOption {
 }
 
 /// A stock position held after assignment.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SharePosition {
     pub shares: i64,
     /// Per-share cost basis, ideally reduced by premium already collected.
