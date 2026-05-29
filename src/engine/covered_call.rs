@@ -74,6 +74,7 @@ pub fn select_covered_call(
             kind: ActionKind::SellCall,
             right: Right::Call,
             strike: q.strike,
+            underlying_price: spot,
             expiry: q.expiry,
             dte: d,
             quantity: available,

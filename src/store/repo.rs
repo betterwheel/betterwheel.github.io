@@ -107,6 +107,28 @@ impl Store {
         Ok(())
     }
 
+    // --- settings (a single-row blob of the user's live-tunable overrides) ---
+
+    /// The persisted user-settings blob, if the user has saved any.
+    pub async fn get_settings_blob(&self) -> Result<Option<String>> {
+        let row: Option<(String,)> = sqlx::query_as("SELECT json FROM settings WHERE id = 1")
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(|(j,)| j))
+    }
+
+    /// Persist the user-settings blob (single row, id = 1; upsert).
+    pub async fn put_settings_blob(&self, blob: &str) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO settings (id, json) VALUES (1, ?1)
+             ON CONFLICT(id) DO UPDATE SET json = excluded.json",
+        )
+        .bind(blob)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     // --- wheel positions ---
 
     pub async fn upsert_position(&self, p: &WheelPositionRow) -> Result<()> {
@@ -300,6 +322,18 @@ fn now() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn settings_blob_roundtrip() {
+        let s = Store::open_in_memory().await.unwrap();
+        // Absent until written — callers fall back to config defaults.
+        assert!(s.get_settings_blob().await.unwrap().is_none());
+        s.put_settings_blob("win = 70").await.unwrap();
+        assert_eq!(s.get_settings_blob().await.unwrap().as_deref(), Some("win = 70"));
+        // Upsert overwrites the single row rather than inserting a second.
+        s.put_settings_blob("win = 80").await.unwrap();
+        assert_eq!(s.get_settings_blob().await.unwrap().as_deref(), Some("win = 80"));
+    }
 
     #[tokio::test]
     async fn watchlist_roundtrip() {

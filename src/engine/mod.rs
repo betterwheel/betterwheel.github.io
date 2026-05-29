@@ -30,17 +30,41 @@ pub struct SymbolContext<'a> {
 
 /// Produce suggestions for one symbol based on its current wheel state.
 pub fn plan_for_symbol(ctx: &SymbolContext, cfg: &EngineConfig, today: NaiveDate) -> Vec<Suggestion> {
+    plan_for_symbol_mode(ctx, cfg, today, false)
+}
+
+/// Like [`plan_for_symbol`], but `hedged` makes the entry a defined-risk put
+/// credit spread (Hedged Wheel) instead of a cash-secured put. Management of
+/// already-open positions is identical in both modes.
+fn plan_for_symbol_mode(
+    ctx: &SymbolContext,
+    cfg: &EngineConfig,
+    today: NaiveDate,
+    hedged: bool,
+) -> Vec<Suggestion> {
     let mut out = Vec::new();
     match ctx.state {
         WheelState::Idle => {
-            if let Some(s) = csp::select_csp(
-                &ctx.symbol,
-                ctx.underlying,
-                ctx.option_quotes,
-                ctx.max_collateral,
-                cfg,
-                today,
-            ) {
+            let entry = if hedged {
+                csp::select_put_spread(
+                    &ctx.symbol,
+                    ctx.underlying,
+                    ctx.option_quotes,
+                    ctx.max_collateral,
+                    cfg,
+                    today,
+                )
+            } else {
+                csp::select_csp(
+                    &ctx.symbol,
+                    ctx.underlying,
+                    ctx.option_quotes,
+                    ctx.max_collateral,
+                    cfg,
+                    today,
+                )
+            };
+            if let Some(s) = entry {
                 out.push(s);
             }
         }
@@ -71,11 +95,26 @@ pub fn plan_for_symbol(ctx: &SymbolContext, cfg: &EngineConfig, today: NaiveDate
 }
 
 /// Build a full plan across many symbols, ordered so time-sensitive management
-/// actions (closes, rolls) come before new entries, then by yield.
+/// actions (closes, rolls) come before new entries, then by yield. Classic Wheel
+/// (cash-secured put entries).
 pub fn plan(contexts: &[SymbolContext], cfg: &EngineConfig, today: NaiveDate) -> ActionPlan {
+    plan_with(contexts, cfg, today, false)
+}
+
+/// Like [`plan`], but entries are defined-risk put credit spreads (Hedged Wheel).
+pub fn plan_hedged(contexts: &[SymbolContext], cfg: &EngineConfig, today: NaiveDate) -> ActionPlan {
+    plan_with(contexts, cfg, today, true)
+}
+
+fn plan_with(
+    contexts: &[SymbolContext],
+    cfg: &EngineConfig,
+    today: NaiveDate,
+    hedged: bool,
+) -> ActionPlan {
     let mut suggestions: Vec<Suggestion> = contexts
         .iter()
-        .flat_map(|ctx| plan_for_symbol(ctx, cfg, today))
+        .flat_map(|ctx| plan_for_symbol_mode(ctx, cfg, today, hedged))
         .collect();
 
     suggestions.sort_by(|a, b| {
@@ -96,7 +135,7 @@ fn kind_priority(k: &ActionKind) -> u8 {
     match k {
         ActionKind::CloseForProfit => 0,
         ActionKind::Roll { .. } => 1,
-        ActionKind::SellPut | ActionKind::SellCall => 2,
+        ActionKind::SellPut | ActionKind::SellCall | ActionKind::SellPutSpread { .. } => 2,
     }
 }
 

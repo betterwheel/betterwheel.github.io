@@ -13,7 +13,11 @@ market_data = "delayed"   # realtime | frozen | delayed | delayed_frozen
 reconnect_secs = 15       # retry connecting every N s while offline (0 = off)
 
 [engine]                  # wheel tuning — common r/thetagang norms
-target_delta = 0.30       # ideal short-option delta
+# Tip: target_delta and take_profit_pct are also tunable live in the app's
+# Settings tab (as "win rate" and "take-profit %"); changes there are saved to
+# the local db and override these defaults. Adjusting win rate re-centers the
+# delta band below around 1 − win.
+target_delta = 0.30       # ideal short-option delta (≈ 1 − win probability)
 min_delta = 0.16          # acceptable entry delta band
 max_delta = 0.35
 min_dte = 25              # days-to-expiration band for entries
@@ -26,6 +30,8 @@ min_open_interest = 100   # liquidity floor
 min_premium = 0.05        # ignore dust
 risk_free_rate = 0.04     # used by the Black-Scholes delta fallback
 cc_min_pct_above_basis = 0.0  # covered-call strike must sit this far above basis
+hedge_pct_below = 0.05    # Hedged Wheel: protective put at most this far below short (caps width)
+hedge_min_credit = 0.10   # Hedged Wheel: skip put spreads with net credit below this
 
 [guardrails]
 max_total_deployed = 50000.0   # cap on total CSP collateral deployed
