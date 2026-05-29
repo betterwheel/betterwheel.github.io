@@ -175,6 +175,14 @@ impl Ibkr {
         }
     }
 
+    /// Whether the socket to Gateway/TWS is currently up. `ibapi` tracks this on
+    /// its message bus; we poll it so a Gateway that vanished (closed/crashed) is
+    /// detected and the UI can drop to offline and start reconnecting, rather than
+    /// claiming "live" forever.
+    pub fn is_connected(&self) -> bool {
+        self.client.is_connected()
+    }
+
     /// Resolve the underlying's IBKR contract id (needed for the option chain).
     pub async fn underlying_contract_id(&self, symbol: &str) -> Result<i32> {
         let contract = Contract::stock(symbol).build();

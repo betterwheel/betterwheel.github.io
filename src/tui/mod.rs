@@ -37,6 +37,10 @@ pub async fn run(
     app.offline_reason = offline_reason;
     let mut events = EventStream::new();
     let mut tick = tokio::time::interval(Duration::from_millis(250));
+    // Poll the live connection's health so a Gateway that vanished (closed or
+    // crashed) is noticed within a few seconds — otherwise the header claims
+    // "live" forever and reconnect (which only runs while offline) never starts.
+    let mut health = tokio::time::interval(Duration::from_secs(5));
 
     // Off-loop broker results — auto-reconnects and background reloads report
     // here so the select! loop never blocks on broker I/O. Keeping `upd_tx` alive
@@ -99,6 +103,23 @@ pub async fn run(
                         BrokerUpdate::ConnectFailed(reason) => app.set_offline_reason(reason),
                         BrokerUpdate::Reloaded(data) => app.apply_live_data(*data, &store).await,
                     }
+                }
+            }
+            _ = health.tick() => {
+                // The live socket vanished (Gateway closed/crashed): drop to
+                // offline, stop the now-dead order consumer, and restart the
+                // reconnect loop. `is_connected()` is `ibapi`'s message-bus state.
+                let dropped = app.connected
+                    && app.ibkr.as_ref().is_some_and(|ib| !ib.is_connected());
+                if dropped {
+                    app.set_disconnected("IB Gateway connection lost — reconnecting…".into());
+                    if let Some(h) = order_consumer.take() {
+                        h.abort();
+                    }
+                    if let Some(h) = reconnect.take() {
+                        h.abort();
+                    }
+                    reconnect = spawn_reconnect(app.cfg.connection.clone(), &upd_tx);
                 }
             }
             _ = tick.tick() => {}              // periodic redraw
