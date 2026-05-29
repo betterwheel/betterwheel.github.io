@@ -11,6 +11,7 @@
 //! always populated.
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::Result;
 use chrono::{Local, NaiveDate};
@@ -135,6 +136,8 @@ pub struct App {
     reloading: bool,
     /// A reload was requested while one was running; run one more when it lands.
     reload_pending: bool,
+    /// When the in-flight background reload started, for the UI loading timer.
+    reload_started: Option<Instant>,
     /// Why we're offline, shown on the dashboard; cleared once connected.
     pub offline_reason: Option<String>,
     pub should_quit: bool,
@@ -218,6 +221,7 @@ impl App {
             update_tx: None,
             reloading: false,
             reload_pending: false,
+            reload_started: None,
             offline_reason: None,
             should_quit: false,
         };
@@ -230,7 +234,9 @@ impl App {
             .into_iter()
             .map(PendingRoll::from_row)
             .collect();
-        app.reload(store).await?;
+        // Cheap, broker-free load so the UI draws instantly; the live gather runs
+        // off the event loop right after startup (see `tui::run`).
+        app.load_local(store).await?;
         Ok(app)
     }
 
@@ -991,6 +997,30 @@ impl App {
         initial_status(self.connected)
     }
 
+    /// Load only the cheap, broker-free state (watchlist, journal, wheel
+    /// positions; demo suggestions when offline) so the UI can draw immediately
+    /// at startup. Live broker data is fetched off the event loop right after
+    /// (see [`super::run`]), so startup never blocks on slow broker I/O.
+    async fn load_local(&mut self, store: &Store) -> Result<()> {
+        self.watchlist = store.list_watchlist().await?;
+        self.journal = store.recent_journal(200).await?;
+        if self.ibkr.is_none() {
+            let today = Local::now().date_naive();
+            let symbols: Vec<String> = self
+                .watchlist
+                .iter()
+                .filter(|r| r.is_enabled())
+                .map(|r| r.symbol.clone())
+                .collect();
+            self.suggestions = demo::demo_suggestions(&symbols, &self.cfg.engine, today);
+        }
+        self.positions = store.list_positions().await?;
+        if self.selected >= self.list_len() {
+            self.selected = self.list_len().saturating_sub(1);
+        }
+        Ok(())
+    }
+
     /// Reload local state + (when connected) refresh broker data + suggestions.
     ///
     /// When connected, broker holdings drive the wheel-state machine: positions
@@ -1103,6 +1133,11 @@ impl App {
         self.reloading
     }
 
+    /// Elapsed time of the in-flight background reload (for the UI loading timer).
+    pub fn loading_elapsed(&self) -> Option<std::time::Duration> {
+        self.reload_started.map(|t| t.elapsed())
+    }
+
     /// Re-read the local watchlist into state and keep the selection in range.
     /// Membership is local and user-driven, so add/delete must show up at once —
     /// independent of the slower, off-loop broker refresh.
@@ -1129,6 +1164,7 @@ impl App {
             return;
         }
         self.reloading = true;
+        self.reload_started = Some(Instant::now());
         self.status = "refreshing live data…".into();
         let store = store.clone();
         let cfg = self.cfg.clone();
@@ -1170,10 +1206,17 @@ impl App {
             self.status = "broker positions unavailable — suggestions cleared until refresh".into();
         }
         self.positions = d.positions;
+        tracing::info!(
+            "reload applied: {} suggestions, {} watchlist rows, {} broker positions",
+            self.suggestions.len(),
+            self.watchlist.len(),
+            self.broker_positions.len()
+        );
         if self.selected >= self.list_len() {
             self.selected = self.list_len().saturating_sub(1);
         }
         self.reloading = false;
+        self.reload_started = None;
         if self.reload_pending {
             self.reload_pending = false;
             self.request_reload(store).await;
