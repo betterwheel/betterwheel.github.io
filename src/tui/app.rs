@@ -27,6 +27,7 @@ use crate::config::{Config, TradingMode, UserSettings};
 use crate::engine::types::{ActionKind, Right, Suggestion, WheelState};
 use crate::ibkr::{
     AccountSnapshot, Ibkr, OpenOrderInfo, OptionOrder, OrderEvent, OrderOutcome, PositionRow, Side,
+    SpreadOrder,
 };
 use crate::store::{
     JournalRow, NewJournalEntry, PendingRollRow, Store, WatchlistRow, WheelPositionRow,
@@ -502,17 +503,15 @@ impl App {
 
     /// Submit a what-if for the selected suggestion; journal it; show the result.
     async fn preview_suggestion(&mut self, sug: &Suggestion, store: &Store) -> Result<()> {
-        if matches!(sug.kind, ActionKind::SellPutSpread { .. }) {
-            self.status =
-                "Hedged Wheel spread execution arrives in the next step (combo orders)".into();
-            return Ok(());
-        }
         let Some(ibkr) = self.ibkr.clone() else {
             self.status = "not connected — start IB Gateway first".into();
             return Ok(());
         };
         if let ActionKind::Roll { to_expiry, to_strike } = sug.kind {
             return self.preview_roll(&ibkr, sug, to_expiry, to_strike, store).await;
+        }
+        if let ActionKind::SellPutSpread { long_strike, .. } = sug.kind {
+            return self.preview_or_execute_spread(&ibkr, sug, long_strike, true, store).await;
         }
         let Some((side, right_str)) = side_and_right(sug) else {
             self.status = "this action can't be previewed".into();
@@ -580,11 +579,6 @@ impl App {
     /// Transmit the selected suggestion (live order). Gated on armed +
     /// connected + not read_only; auto-disarms after a successful submission.
     async fn execute_suggestion(&mut self, sug: &Suggestion, store: &Store) -> Result<()> {
-        if matches!(sug.kind, ActionKind::SellPutSpread { .. }) {
-            self.status =
-                "Hedged Wheel spread execution arrives in the next step (combo orders)".into();
-            return Ok(());
-        }
         if !self.armed {
             self.status = "disarmed — press `A` to arm before executing".into();
             return Ok(());
@@ -606,6 +600,9 @@ impl App {
         };
         if let ActionKind::Roll { to_expiry, to_strike } = sug.kind {
             return self.execute_roll(&ibkr, sug, to_expiry, to_strike, store).await;
+        }
+        if let ActionKind::SellPutSpread { long_strike, .. } = sug.kind {
+            return self.preview_or_execute_spread(&ibkr, sug, long_strike, false, store).await;
         }
         let Some((side, right_str)) = side_and_right(sug) else {
             self.status = "this action can't be executed".into();
@@ -645,6 +642,89 @@ impl App {
             }
             Err(e) => {
                 self.status = format!("execute error: {e}");
+                store
+                    .record(&NewJournalEntry {
+                        status: "rejected".into(),
+                        note: Some(e.to_string()),
+                        ..entry_base
+                    })
+                    .await?;
+            }
+        }
+        self.journal = store.recent_journal(200).await?;
+        Ok(())
+    }
+
+    /// Preview (what-if) or transmit a defined-risk **put credit spread** as one
+    /// atomic combo, journaled as a single entry. Shared by the preview/execute
+    /// paths so they can't drift; the execute caller has already enforced the
+    /// arm / read_only / max-contracts guardrails (preview needs none).
+    async fn preview_or_execute_spread(
+        &mut self,
+        ibkr: &Ibkr,
+        sug: &Suggestion,
+        long_strike: f64,
+        preview: bool,
+        store: &Store,
+    ) -> Result<()> {
+        let expiry = sug.expiry.format("%Y%m%d").to_string();
+        let order = SpreadOrder {
+            symbol: &sug.symbol,
+            expiry_yyyymmdd: &expiry,
+            short_strike: sug.strike,
+            long_strike,
+            quantity: sug.quantity,
+            net_credit: sug.limit_price,
+        };
+        // One journal row for the whole combo, noting both legs (IBKR returns a
+        // single combo order id).
+        let note = format!(
+            "put credit spread: sell {:.1}P / buy {:.1}P, net credit {:.2}",
+            sug.strike, long_strike, sug.limit_price
+        );
+        let entry_base = NewJournalEntry { note: Some(note), ..journal_entry_for(sug, &expiry, "P") };
+        match ibkr.submit_or_preview_spread(&order, preview).await {
+            Ok(OrderOutcome::Preview(state)) => {
+                let margin = state
+                    .initial_margin_after
+                    .map(|v| format!("${v:.0}"))
+                    .unwrap_or_else(|| "?".into());
+                let commission = state
+                    .commission
+                    .map(|v| format!("${v:.2}"))
+                    .unwrap_or_else(|| "?".into());
+                self.status = format!(
+                    "preview {} put spread {:.1}/{:.1} @{:.2}cr ×{}: margin {} · commission {} · {}",
+                    sug.symbol, sug.strike, long_strike, sug.limit_price, sug.quantity, margin,
+                    commission, state.status
+                );
+                store
+                    .record(&NewJournalEntry {
+                        status: "previewed".into(),
+                        premium: Some(sug.premium_total),
+                        ..entry_base
+                    })
+                    .await?;
+            }
+            Ok(OrderOutcome::Submitted(oid)) => {
+                self.status = format!(
+                    "submitted {} put spread {:.1}/{:.1} @{:.2}cr ×{} → id {oid}",
+                    sug.symbol, sug.strike, long_strike, sug.limit_price, sug.quantity
+                );
+                store
+                    .record(&NewJournalEntry {
+                        status: "submitted".into(),
+                        ibkr_order_id: Some(oid),
+                        premium: Some(sug.premium_total),
+                        ..entry_base
+                    })
+                    .await?;
+                // Safety: a successful transmit auto-disarms.
+                self.armed = false;
+            }
+            Err(e) => {
+                self.status =
+                    format!("{} spread error: {e}", if preview { "preview" } else { "execute" });
                 store
                     .record(&NewJournalEntry {
                         status: "rejected".into(),
@@ -1633,6 +1713,37 @@ mod tests {
         app.cfg.guardrails.max_contracts_per_order = 10;
         app.execute_suggestion(&sell_put(1), &store).await.unwrap();
         assert!(app.status.contains("not connected"), "status: {}", app.status);
+        assert!(store.recent_journal(10).await.unwrap().is_empty());
+    }
+
+    fn sell_put_spread(qty: i32) -> Suggestion {
+        let mut s = sug(
+            ActionKind::SellPutSpread { long_strike: 95.0, long_price: 1.0 },
+            Right::Put,
+        );
+        s.quantity = qty;
+        s
+    }
+
+    #[tokio::test]
+    async fn spread_execute_blocked_when_disarmed() {
+        // The Hedged Wheel's combo path must sit behind the same 3-step gate.
+        let store = Store::open_in_memory().await.unwrap();
+        let mut app = offline_app(&store).await;
+        app.armed = false;
+        app.execute_suggestion(&sell_put_spread(1), &store).await.unwrap();
+        assert!(app.status.contains("disarmed"), "status: {}", app.status);
+        assert!(store.recent_journal(10).await.unwrap().is_empty(), "nothing journaled");
+    }
+
+    #[tokio::test]
+    async fn spread_execute_blocked_when_read_only() {
+        let store = Store::open_in_memory().await.unwrap();
+        let mut app = offline_app(&store).await;
+        app.armed = true;
+        app.cfg.guardrails.read_only = true;
+        app.execute_suggestion(&sell_put_spread(1), &store).await.unwrap();
+        assert!(app.status.contains("read_only"), "status: {}", app.status);
         assert!(store.recent_journal(10).await.unwrap().is_empty());
     }
 

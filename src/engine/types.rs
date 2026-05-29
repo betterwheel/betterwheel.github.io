@@ -60,6 +60,10 @@ pub enum WheelState {
     Idle,
     /// A short cash-secured put is open.
     ShortPut,
+    /// A short put hedged by a long put below it (a defined-risk put credit
+    /// spread — the Hedged Wheel's open position). Managed like [`Self::ShortPut`]
+    /// on the short leg; the long leg is protection that rides along.
+    HedgedShortPut,
     /// Assigned: holding >= 100 shares, eligible to sell covered calls.
     LongShares,
     /// A covered call is open against held shares.
@@ -72,6 +76,7 @@ impl WheelState {
         match self {
             WheelState::Idle => "Idle",
             WheelState::ShortPut => "ShortPut",
+            WheelState::HedgedShortPut => "HedgedShortPut",
             WheelState::LongShares => "LongShares",
             WheelState::ShortCall => "ShortCall",
         }
@@ -81,6 +86,7 @@ impl WheelState {
     pub fn parse(s: &str) -> WheelState {
         match s {
             "ShortPut" => WheelState::ShortPut,
+            "HedgedShortPut" => WheelState::HedgedShortPut,
             "LongShares" => WheelState::LongShares,
             "ShortCall" => WheelState::ShortCall,
             _ => WheelState::Idle,

@@ -341,8 +341,10 @@ pub(super) async fn live_suggestions(
         // that we must be able to close, so keep managing existing positions;
         // only suppress *new opening* legs (entry / covered call). Rolls — which
         // open a new leg the account can't take — are filtered out below.
-        let manages_existing =
-            matches!(reconciled.state, WheelState::ShortPut | WheelState::ShortCall);
+        let manages_existing = matches!(
+            reconciled.state,
+            WheelState::ShortPut | WheelState::HedgedShortPut | WheelState::ShortCall
+        );
         if w.tradable == Some(0) && !manages_existing {
             continue;
         }
@@ -435,7 +437,7 @@ async fn gather_inputs(
                 max_collateral: 0.0,
             }))
         }
-        WheelState::ShortPut | WheelState::ShortCall => {
+        WheelState::ShortPut | WheelState::HedgedShortPut | WheelState::ShortCall => {
             gather_manage_inputs(ibkr, w, reconciled).await
         }
     }
