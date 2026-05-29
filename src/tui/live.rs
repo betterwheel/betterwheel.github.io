@@ -25,7 +25,7 @@ const MAX_OTM_MONEYNESS: f64 = 0.15;
 /// Cap on per-symbol option snapshots, to bound market-data requests. Sampled
 /// *spread across* the OTM range (see [`sample_spread`]) so the target-delta
 /// band is covered, then fetched concurrently.
-const MAX_CHAIN_STRIKES: usize = 8;
+const MAX_CHAIN_STRIKES: usize = 12;
 /// Far-OTM put target (fraction of spot) used by the tradability permission probe.
 const PROBE_OTM_FRACTION: f64 = 0.85;
 
@@ -40,6 +40,8 @@ pub(super) struct LiveData {
     pub positions: Vec<WheelPositionRow>,
     pub broker_positions: Vec<PositionRow>,
     pub suggestions: Vec<Suggestion>,
+    /// Hedged Wheel suggestions (defined-risk put spreads), from the same fetch.
+    pub hedged_suggestions: Vec<Suggestion>,
     /// Authoritative open orders, or `None` if that snapshot failed.
     pub open_orders: Option<Vec<OpenOrderInfo>>,
     /// `false` when the positions snapshot was incomplete: the caller must NOT
@@ -69,7 +71,7 @@ pub(super) async fn gather(
     probe_unknown_tradability(ibkr, store, &watchlist, today).await;
     watchlist = store.list_watchlist().await.unwrap_or_default();
 
-    let (broker_positions, suggestions, open_orders, positions_ok) = match ibkr.positions().await {
+    let (broker_positions, suggestions, hedged_suggestions, open_orders, positions_ok) = match ibkr.positions().await {
         Ok(positions) => {
             sync_wheel_state(store, &positions).await;
             // Authoritative open orders pick which symbols to skip; on a failed
@@ -86,14 +88,14 @@ pub(super) async fn gather(
                     (None, w)
                 }
             };
-            let suggestions =
+            let (suggestions, hedged_suggestions) =
                 live_suggestions(ibkr, store, &watchlist, &positions, &working, cfg, today).await;
-            (positions, suggestions, open_orders, true)
+            (positions, suggestions, hedged_suggestions, open_orders, true)
         }
         Err(e) => {
             // Positions unknown — keep stored state, drop suggestions downstream.
             tracing::warn!("positions fetch failed; suggestions will be cleared, stored state kept: {e}");
-            (Vec::new(), Vec::new(), None, false)
+            (Vec::new(), Vec::new(), Vec::new(), None, false)
         }
     };
 
@@ -107,6 +109,7 @@ pub(super) async fn gather(
         positions,
         broker_positions,
         suggestions,
+        hedged_suggestions,
         open_orders,
         positions_ok,
     }
@@ -315,10 +318,10 @@ pub(super) async fn live_suggestions(
     working: &[String],
     cfg: &Config,
     today: NaiveDate,
-) -> Vec<Suggestion> {
+) -> (Vec<Suggestion>, Vec<Suggestion>) {
     let active: Vec<&WatchlistRow> = watchlist.iter().filter(|w| w.is_enabled()).collect();
     if active.is_empty() {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     }
     // Size new-entry collateral against the symbols actually eligible to open
     // one (enabled and not blocked); blocked symbols are managed only.
@@ -364,16 +367,23 @@ pub(super) async fn live_suggestions(
         })
         .collect();
 
-    let mut suggestions = engine::plan(&contexts, &cfg.engine, today).suggestions;
-    // A blocked symbol can be closed but not (re)opened, so drop rolls (which
-    // open a new leg) for it; its buy-to-close take-profit action still stands.
-    suggestions.retain(|s| {
-        !(matches!(s.kind, ActionKind::Roll { .. })
-            && watchlist
-                .iter()
-                .any(|w| w.symbol == s.symbol && w.tradable == Some(0)))
-    });
-    suggestions
+    // A blocked symbol can be closed but not (re)opened, so drop rolls (which open
+    // a new leg) for it; its buy-to-close take-profit still stands. Applied to both
+    // the Classic and Hedged lists, which share these contexts.
+    let drop_blocked_rolls = |list: &mut Vec<Suggestion>| {
+        list.retain(|s| {
+            !(matches!(s.kind, ActionKind::Roll { .. })
+                && watchlist
+                    .iter()
+                    .any(|w| w.symbol == s.symbol && w.tradable == Some(0)))
+        });
+    };
+
+    let mut classic = engine::plan(&contexts, &cfg.engine, today).suggestions;
+    let mut hedged = engine::plan_hedged(&contexts, &cfg.engine, today).suggestions;
+    drop_blocked_rolls(&mut classic);
+    drop_blocked_rolls(&mut hedged);
+    (classic, hedged)
 }
 
 /// Fetch the market data the engine needs for one symbol, dispatched on the

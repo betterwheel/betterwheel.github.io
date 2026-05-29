@@ -1,10 +1,11 @@
 //! Rendering — a pure function of [`App`] state.
 
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, Cell, Paragraph, Row, Table, Tabs, Wrap};
+use ratatui::widgets::{Block, Cell, Clear, Paragraph, Row, Table, Tabs, Wrap};
 
 use super::app::{App, InputMode, Tab};
-use crate::engine::types::{ActionKind, Suggestion};
+use crate::engine::math::short_put_pnl_at;
+use crate::engine::types::{ActionKind, Right, Suggestion};
 
 const SEL: Style = Style::new().fg(Color::Black).bg(Color::Cyan);
 const HEAD: Style = Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD);
@@ -19,10 +20,17 @@ pub fn render(frame: &mut Frame, app: &App) {
         Tab::Dashboard => render_dashboard(frame, app, mid),
         Tab::Watchlist => render_watchlist(frame, app, mid),
         Tab::Suggestions => render_suggestions(frame, app, mid),
+        Tab::HedgedWheel => render_hedged_suggestions(frame, app, mid),
         Tab::Journal => render_journal(frame, app, mid),
+        Tab::Settings => render_settings(frame, app, mid),
         Tab::Help => render_help(frame, mid),
     }
     render_status(frame, app, bottom);
+
+    // Modal detail panel over the selected suggestion, drawn last so it's on top.
+    if app.detail_open {
+        render_suggestion_detail(frame, app, frame.area());
+    }
 }
 
 fn render_tabs(frame: &mut Frame, app: &App, area: Rect) {
@@ -59,7 +67,7 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect) {
     let text = match &app.input {
         InputMode::AddSymbol(buf) => format!(" add symbol: {buf}_ "),
         InputMode::Normal => format!(
-            " {}   ·   q quit · tab switch · j/k move · a add · d delete · r refresh · ? help",
+            " {}   ·   q quit · tab switch · j/k move · enter details · a add · d del · r refresh · ? help",
             app.status
         ),
     };
@@ -182,12 +190,37 @@ fn render_watchlist(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_suggestions(frame: &mut Frame, app: &App, area: Rect) {
+    render_suggestion_table(frame, app, area, &app.suggestions, Tab::Suggestions, "cash-secured puts");
+}
+
+/// Hedged Wheel tab: defined-risk put credit spreads (see [`render_suggestions`]).
+fn render_hedged_suggestions(frame: &mut Frame, app: &App, area: Rect) {
+    render_suggestion_table(
+        frame,
+        app,
+        area,
+        &app.hedged_suggestions,
+        Tab::HedgedWheel,
+        "defined-risk put spreads",
+    );
+}
+
+/// Shared table renderer for the Classic Suggestions and Hedged Wheel tabs.
+fn render_suggestion_table(
+    frame: &mut Frame,
+    app: &App,
+    area: Rect,
+    suggestions: &[Suggestion],
+    tab: Tab,
+    noun: &str,
+) {
     let header =
         Row::new(["Symbol", "Action", "Strike", "Expiry", "DTE", "Δ", "Premium", "Ann%", "Capital"])
             .style(HEAD);
-    let rows = app.suggestions.iter().enumerate().map(|(i, s)| {
-        styled_row(suggestion_cells(s), app.tab == Tab::Suggestions && i == app.selected)
-    });
+    let rows = suggestions
+        .iter()
+        .enumerate()
+        .map(|(i, s)| styled_row(suggestion_cells(s), app.tab == tab && i == app.selected));
     let widths = [
         Constraint::Length(8),
         Constraint::Length(10),
@@ -199,17 +232,326 @@ fn render_suggestions(frame: &mut Frame, app: &App, area: Rect) {
         Constraint::Length(7),
         Constraint::Length(10),
     ];
-    let title = if !app.suggestions.is_empty() {
-        format!(" Suggestions ({}) — cash-secured puts, best yield first ", app.suggestions.len())
+    let title = if !suggestions.is_empty() {
+        format!(" {} ({}) — {noun}, best yield first ", tab.title(), suggestions.len())
     } else if let Some(d) = app.loading_elapsed() {
-        format!(" Suggestions — ⟳ syncing live data… {}s ", d.as_secs())
+        format!(" {} — ⟳ syncing live data… {}s ", tab.title(), d.as_secs())
     } else {
-        " Suggestions — none yet (press 'r' to refresh, or add higher-IV tickers) ".to_string()
+        format!(" {} — none yet (press 'r' to refresh, or add tickers) ", tab.title())
     };
     frame.render_widget(
         Table::new(rows, widths).header(header).block(Block::bordered().title(title)),
         area,
     );
+}
+
+/// A `pct_x` × `pct_y` percent rectangle centered in `area`, for modal popups.
+fn centered_rect(pct_x: u16, pct_y: u16, area: Rect) -> Rect {
+    let [_, v, _] = Layout::vertical([
+        Constraint::Percentage((100 - pct_y) / 2),
+        Constraint::Percentage(pct_y),
+        Constraint::Percentage((100 - pct_y) / 2),
+    ])
+    .areas(area);
+    let [_, h, _] = Layout::horizontal([
+        Constraint::Percentage((100 - pct_x) / 2),
+        Constraint::Percentage(pct_x),
+        Constraint::Percentage((100 - pct_x) / 2),
+    ])
+    .areas(v);
+    h
+}
+
+/// Short human label for an action kind.
+fn action_title(kind: &ActionKind) -> &'static str {
+    match kind {
+        ActionKind::SellPut => "Cash-Secured Put",
+        ActionKind::SellCall => "Covered Call",
+        ActionKind::CloseForProfit => "Close for Profit",
+        ActionKind::Roll { .. } => "Roll (defend)",
+        ActionKind::SellPutSpread { .. } => "Put Credit Spread",
+    }
+}
+
+/// Modal detail panel for the selected suggestion: plain-English mechanics plus
+/// the gated actions. Drawn over everything else.
+fn render_suggestion_detail(frame: &mut Frame, app: &App, area: Rect) {
+    let Some(s) = app.selected_suggestion() else {
+        return;
+    };
+    let popup = centered_rect(72, 80, area);
+    frame.render_widget(Clear, popup);
+    let border = if app.armed {
+        Style::new().fg(Color::Red).add_modifier(Modifier::BOLD)
+    } else {
+        Style::new().fg(Color::Cyan)
+    };
+    let block = Block::bordered()
+        .title(format!(" {} — {} ", s.symbol, action_title(&s.kind)))
+        .border_style(border);
+    frame.render_widget(
+        Paragraph::new(suggestion_detail_lines(s, app))
+            .block(block)
+            .wrap(Wrap { trim: false }),
+        popup,
+    );
+}
+
+/// Plain-English explanation of a suggestion (what you sell, collect, and risk)
+/// plus an action bar reflecting the preview → arm → execute gate.
+/// One detail line for the take-profit target: the buy-back price and the
+/// profit banked when `take_profit_pct` of the credit is captured early. Uses
+/// the live (Settings-tunable) `take_profit_pct`, so it tracks the user's knob.
+fn take_profit_line(s: &Suggestion, app: &App) -> Line<'static> {
+    let tp = app.cfg.engine.take_profit_pct;
+    Line::from(format!(
+        "  Take-profit   {:.0}% → buy back ~${:.2}/sh, bank ~${:.0}",
+        tp * 100.0,
+        s.limit_price * (1.0 - tp),
+        s.premium_total * tp
+    ))
+}
+
+/// P&L-at-expiry rows for a series of downward moves in the underlying — the
+/// concrete "what do I actually lose if it drops X%" that a strike-to-zero line
+/// never answered. `long_strike` `Some(..)` caps the loss (a put spread); `None`
+/// is a bare short put. Empty if the spot is unknown. Profit green, loss red.
+fn downside_scenarios(
+    spot: f64,
+    short_strike: f64,
+    credit: f64,
+    long_strike: Option<f64>,
+    shares: f64,
+) -> Vec<Line<'static>> {
+    if spot <= 0.0 {
+        return Vec::new();
+    }
+    let dim = Style::new().fg(Color::DarkGray);
+    let good = Style::new().fg(Color::Green);
+    let bad = Style::new().fg(Color::Red);
+    let mut out = vec![Line::styled(
+        "  If the stock falls, your P&L at expiry:".to_string(),
+        dim,
+    )];
+    for mv in [0.05f64, 0.10, 0.20, 0.30, 0.40] {
+        let s_t = spot * (1.0 - mv);
+        let pnl = short_put_pnl_at(s_t, short_strike, credit, long_strike, shares);
+        let (style, sign) = if pnl >= 0.0 { (good, "+") } else { (bad, "−") };
+        out.push(Line::styled(
+            format!("    −{:>2.0}%  →  ${s_t:>8.2}   {sign}${:>9.0}", mv * 100.0, pnl.abs()),
+            style,
+        ));
+    }
+    out
+}
+
+fn suggestion_detail_lines(s: &Suggestion, app: &App) -> Vec<Line<'static>> {
+    let dim = Style::new().fg(Color::DarkGray);
+    let good = Style::new().fg(Color::Green);
+    let warn = Style::new().fg(Color::Yellow);
+    let qty = s.quantity;
+    let shares = qty * 100;
+    let prem = s.premium_total;
+    let right = match s.right {
+        Right::Put => "put",
+        Right::Call => "call",
+    };
+    let mut lines: Vec<Line<'static>> = Vec::new();
+
+    match &s.kind {
+        ActionKind::SellPut => {
+            let breakeven = s.strike - s.limit_price;
+            lines.push(Line::from(format!(
+                "SELL {qty} {} ${:.1} put, expiring {} ({}d).",
+                s.symbol, s.strike, s.expiry, s.dte
+            )));
+            lines.push(Line::styled(
+                "You're selling insurance against the stock falling below the strike.",
+                dim,
+            ));
+            lines.push(Line::from(""));
+            lines.push(Line::from(format!(
+                "  Collect now   ${prem:.0}   (premium — yours to keep)"
+            )));
+            lines.push(Line::from(format!(
+                "  Set aside     ${:.0}   (cash collateral)",
+                s.capital_required
+            )));
+            lines.push(Line::from(format!(
+                "  Breakeven     ${breakeven:.2}   (strike − premium)"
+            )));
+            if let Some(d) = s.delta {
+                lines.push(Line::from(format!(
+                    "  Win chance    ~{:.0}%   ({d:.2}Δ → ~{:.0}% chance of assignment)",
+                    (1.0 - d) * 100.0,
+                    d * 100.0
+                )));
+            }
+            lines.push(take_profit_line(s, app));
+            lines.push(Line::from(""));
+            lines.push(Line::styled(
+                format!(
+                    "If above ${:.1} at expiry → expires worthless, keep ${prem:.0} (~{:.0}% annualized).",
+                    s.strike,
+                    s.annualized_yield * 100.0
+                ),
+                good,
+            ));
+            lines.push(Line::styled(
+                format!(
+                    "If below ${:.1} → assigned: BUY {shares} shares @ ${:.1} (${:.0}), cost ${breakeven:.2}/sh.",
+                    s.strike, s.strike, s.capital_required
+                ),
+                warn,
+            ));
+            lines.push(Line::from(""));
+            lines.extend(downside_scenarios(
+                s.underlying_price,
+                s.strike,
+                s.limit_price,
+                None,
+                shares as f64,
+            ));
+            lines.push(Line::styled(
+                "  (then the wheel sells covered calls on the shares to lower the basis)",
+                dim,
+            ));
+        }
+        ActionKind::SellCall => {
+            lines.push(Line::from(format!(
+                "SELL {qty} {} ${:.1} call, expiring {} ({}d), against your shares.",
+                s.symbol, s.strike, s.expiry, s.dte
+            )));
+            lines.push(Line::styled(
+                "You own the shares; you're selling someone the right to buy them at the strike.",
+                dim,
+            ));
+            lines.push(Line::from(""));
+            lines.push(Line::from(format!(
+                "  Collect now   ${prem:.0}   (premium — yours to keep)"
+            )));
+            if let Some(d) = s.delta {
+                lines.push(Line::from(format!(
+                    "  Win chance    ~{:.0}%   ({d:.2}Δ → ~{:.0}% chance of being called away)",
+                    (1.0 - d) * 100.0,
+                    d * 100.0
+                )));
+            }
+            lines.push(take_profit_line(s, app));
+            lines.push(Line::from(""));
+            lines.push(Line::styled(
+                format!(
+                    "If below ${:.1} at expiry → expires worthless: keep the premium AND your shares.",
+                    s.strike
+                ),
+                good,
+            ));
+            lines.push(Line::styled(
+                format!(
+                    "If above ${:.1} → shares sold @ ${:.1}: keep premium + gains to the strike, miss upside above.",
+                    s.strike, s.strike
+                ),
+                warn,
+            ));
+        }
+        ActionKind::CloseForProfit => {
+            lines.push(Line::from(format!(
+                "BUY TO CLOSE {qty} {} ${:.1} {right}, ~${:.2}/sh (${prem:.0} total).",
+                s.symbol, s.strike, s.limit_price
+            )));
+            lines.push(Line::styled(
+                "This short has lost most of its value — buying it back locks in the gain and frees the collateral early.",
+                dim,
+            ));
+        }
+        ActionKind::Roll { to_expiry, to_strike } => {
+            lines.push(Line::from(format!(
+                "ROLL {qty} {} ${:.1} {right} → ${:.1} @ {}.",
+                s.symbol, s.strike, to_strike, to_expiry
+            )));
+            lines.push(Line::styled(
+                "This short is being tested. Buy it back and sell a later one (restruck) for a net credit — buys time to defend instead of taking assignment now.",
+                dim,
+            ));
+        }
+        ActionKind::SellPutSpread { long_strike, long_price } => {
+            let width = s.strike - *long_strike;
+            let max_loss = s.capital_required - prem;
+            let breakeven = s.strike - s.limit_price;
+            lines.push(Line::from(format!(
+                "SELL {qty} {} ${:.1}/${long_strike:.1} put spread, expiring {} ({}d).",
+                s.symbol, s.strike, s.expiry, s.dte
+            )));
+            lines.push(Line::styled(
+                format!(
+                    "Defined-risk hedge: sell the ${:.1} put, buy the ${long_strike:.1} put (${long_price:.2}) as protection.",
+                    s.strike
+                ),
+                dim,
+            ));
+            lines.push(Line::from(""));
+            lines.push(Line::from(format!(
+                "  Net credit    ${prem:.0}   (premium in − protection cost)"
+            )));
+            lines.push(Line::from(format!(
+                "  Max loss      ${max_loss:.0}   (CAPPED — ${:.0} width minus credit)",
+                width * 100.0 * qty as f64
+            )));
+            lines.push(Line::from(format!(
+                "  Breakeven     ${breakeven:.2}   (short strike − net credit)"
+            )));
+            if let Some(d) = s.delta {
+                lines.push(Line::from(format!(
+                    "  Win chance    ~{:.0}%   ({d:.2}Δ → ~{:.0}% chance the short is ITM)",
+                    (1.0 - d) * 100.0,
+                    d * 100.0
+                )));
+            }
+            lines.push(take_profit_line(s, app));
+            lines.push(Line::from(""));
+            lines.push(Line::styled(
+                format!(
+                    "If above ${:.1} at expiry → both expire worthless, keep ${prem:.0} (~{:.0}% annualized).",
+                    s.strike,
+                    s.annualized_yield * 100.0
+                ),
+                good,
+            ));
+            lines.push(Line::styled(
+                format!("If it falls → loss is CAPPED at ${max_loss:.0}; the ${long_strike:.1} put stops further downside."),
+                warn,
+            ));
+            lines.push(Line::from(""));
+            lines.extend(downside_scenarios(
+                s.underlying_price,
+                s.strike,
+                s.limit_price,
+                Some(*long_strike),
+                shares as f64,
+            ));
+        }
+    }
+
+    lines.push(Line::from(""));
+    if app.armed {
+        lines.push(Line::styled(
+            "⚡ ARMED — [x] EXECUTE LIVE   ·   [A] disarm   ·   [p] preview   ·   [Esc] back",
+            Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ));
+    } else {
+        lines.push(Line::from(vec![
+            Span::styled("[p]", HEAD),
+            Span::raw(" preview what-if    "),
+            Span::styled("[A]", HEAD),
+            Span::raw(" arm    "),
+            Span::styled("[x]", HEAD),
+            Span::raw(" execute (arm first)    "),
+            Span::styled("[Esc]", HEAD),
+            Span::raw(" back"),
+        ]));
+    }
+    lines.push(Line::styled(format!("  {}", app.status), dim));
+    lines
 }
 
 fn render_journal(frame: &mut Frame, app: &App, area: Rect) {
@@ -244,8 +586,11 @@ fn render_journal(frame: &mut Frame, app: &App, area: Rect) {
 fn render_help(frame: &mut Frame, area: Rect) {
     let lines = vec![
         Line::from(Span::styled("Navigation", HEAD)),
-        Line::from("  Tab / → / ←      switch tabs        1–5   jump to tab"),
+        Line::from("  Tab / → / ←      switch tabs        1–7   jump to tab"),
         Line::from("  j / k  or ↑ / ↓  move selection"),
+        Line::from(""),
+        Line::from(Span::styled("Settings tab", HEAD)),
+        Line::from("  Enter            edit selected knob; then ↑/↓ change it, Enter/Esc to confirm"),
         Line::from(""),
         Line::from(Span::styled("Watchlist", HEAD)),
         Line::from("  a                add a symbol (type ticker, Enter)"),
@@ -267,6 +612,82 @@ fn render_help(frame: &mut Frame, area: Rect) {
     ];
     frame.render_widget(
         Paragraph::new(lines).block(Block::bordered().title(" Help ")),
+        area,
+    );
+}
+
+/// The Settings tab: two live-tunable strategy knobs, the selected one marked.
+fn render_settings(frame: &mut Frame, app: &App, area: Rect) {
+    let s = &app.settings;
+    let on_tab = app.tab == Tab::Settings;
+    let target_delta = (1.0 - s.target_win_pct / 100.0).clamp(0.05, 0.95);
+    let band_lo = (target_delta - 0.10).max(0.05);
+    let band_hi = (target_delta + 0.10).min(0.95);
+
+    let knob = |idx: usize, label: &str, value: String, detail: String| -> Line<'static> {
+        let active = on_tab && app.selected == idx;
+        let editing = active && app.settings_editing;
+        let marker = if active { "▶ " } else { "  " };
+        let label_style = if active {
+            Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+        } else {
+            Style::new()
+        };
+        // While editing, reverse-video the value with a ↕ cue so it's obvious
+        // ↑/↓ now move it; otherwise it's a plain bold number.
+        let value_span = if editing {
+            Span::styled(
+                format!(" {value} ↕ "),
+                SEL.add_modifier(Modifier::BOLD),
+            )
+        } else {
+            Span::styled(format!("{value:>5}"), label_style.add_modifier(Modifier::BOLD))
+        };
+        Line::from(vec![
+            Span::styled(format!("{marker}{label:<17}"), label_style),
+            value_span,
+            Span::styled(format!("    {detail}"), Style::new().fg(Color::DarkGray)),
+        ])
+    };
+
+    let hint = if app.settings_editing {
+        "Editing — ↑/↓ (or k/j) change the value · Enter or Esc when done."
+    } else {
+        "j/k pick a row · Enter to edit · ←/→ or Tab switch tabs · auto-saved."
+    };
+    let lines = vec![
+        Line::styled(hint, Style::new().fg(Color::DarkGray)),
+        Line::from(""),
+        knob(
+            0,
+            "Target win rate",
+            format!("{:.0}%", s.target_win_pct),
+            format!("sell ≈ {target_delta:.2}Δ puts  (band {band_lo:.2}–{band_hi:.2}Δ)"),
+        ),
+        knob(
+            1,
+            "Take-profit",
+            format!("{:.0}%", s.take_profit_pct),
+            "buy back once this much of the credit is captured".to_string(),
+        ),
+        Line::from(""),
+        Line::styled(
+            "Higher win rate → further OTM → smaller credit, but wins more often.",
+            Style::new().fg(Color::DarkGray),
+        ),
+        Line::styled(
+            "Take-profit closes early to bank the gain and free capital before expiry.",
+            Style::new().fg(Color::DarkGray),
+        ),
+        Line::from(""),
+        Line::styled(
+            "These override [engine] in config.toml and persist across restarts.",
+            Style::new().fg(Color::DarkGray),
+        ),
+    ];
+
+    frame.render_widget(
+        Paragraph::new(lines).block(Block::bordered().title(" Settings ")),
         area,
     );
 }
@@ -295,6 +716,7 @@ fn action_label(k: &ActionKind) -> &'static str {
         ActionKind::SellCall => "Sell Call",
         ActionKind::CloseForProfit => "Close",
         ActionKind::Roll { .. } => "Roll",
+        ActionKind::SellPutSpread { .. } => "Put Spread",
     }
 }
 

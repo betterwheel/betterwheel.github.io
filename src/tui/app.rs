@@ -23,7 +23,7 @@ use super::live::{
     gather, live_suggestions, position_has_short, price_leg, probe_unknown_tradability,
     resolve_roll_target, right_char, sync_wheel_state, LiveData,
 };
-use crate::config::{Config, TradingMode};
+use crate::config::{Config, TradingMode, UserSettings};
 use crate::engine::types::{ActionKind, Right, Suggestion, WheelState};
 use crate::ibkr::{
     AccountSnapshot, Ibkr, OpenOrderInfo, OptionOrder, OrderEvent, OrderOutcome, PositionRow, Side,
@@ -39,16 +39,20 @@ pub enum Tab {
     Dashboard,
     Watchlist,
     Suggestions,
+    HedgedWheel,
     Journal,
+    Settings,
     Help,
 }
 
 impl Tab {
-    pub const ALL: [Tab; 5] = [
+    pub const ALL: [Tab; 7] = [
         Tab::Dashboard,
         Tab::Watchlist,
         Tab::Suggestions,
+        Tab::HedgedWheel,
         Tab::Journal,
+        Tab::Settings,
         Tab::Help,
     ];
 
@@ -57,7 +61,9 @@ impl Tab {
             Tab::Dashboard => "Dashboard",
             Tab::Watchlist => "Watchlist",
             Tab::Suggestions => "Suggestions",
+            Tab::HedgedWheel => "Hedged Wheel",
             Tab::Journal => "Journal",
+            Tab::Settings => "Settings",
             Tab::Help => "Help",
         }
     }
@@ -92,6 +98,14 @@ pub enum Action {
     ToggleArm,
     Preview,
     Execute,
+    /// Open the detail panel for the selected suggestion.
+    OpenDetail,
+    /// Close the detail panel.
+    CloseDetail,
+    /// Adjust the selected Settings-tab knob by one step (`+1` up, `-1` down).
+    SettingAdjust(i32),
+    /// Enter/leave edit mode on the selected Settings-tab knob.
+    ToggleSettingEdit,
 }
 
 /// A result from an off-loop broker task, delivered to the run loop so broker
@@ -113,6 +127,8 @@ pub struct App {
     pub tab: Tab,
     pub watchlist: Vec<WatchlistRow>,
     pub suggestions: Vec<Suggestion>,
+    /// Hedged Wheel suggestions (defined-risk put spreads) — the Hedged Wheel tab.
+    pub hedged_suggestions: Vec<Suggestion>,
     pub journal: Vec<JournalRow>,
     /// Per-symbol wheel state from the local store.
     pub positions: Vec<WheelPositionRow>,
@@ -140,6 +156,14 @@ pub struct App {
     reload_started: Option<Instant>,
     /// Why we're offline, shown on the dashboard; cleared once connected.
     pub offline_reason: Option<String>,
+    /// Whether the suggestion detail panel is open (modal over Suggestions).
+    pub detail_open: bool,
+    /// User-tunable strategy knobs (win rate, take-profit); editable on the
+    /// Settings tab, persisted to the store, and overlaid onto `cfg.engine`.
+    pub settings: UserSettings,
+    /// `true` while the selected Settings knob is in edit mode (Enter toggles);
+    /// only then do ↑/↓ change its value, so arrows otherwise still switch tabs.
+    pub settings_editing: bool,
     pub should_quit: bool,
 }
 
@@ -202,12 +226,24 @@ impl PendingRoll {
 impl App {
     pub async fn new(cfg: Config, ibkr: Option<Arc<Ibkr>>, store: &Store) -> Result<Self> {
         let connected = ibkr.is_some();
+        let mut cfg = cfg;
+        // Load any persisted user knobs (win rate, take-profit) and overlay them
+        // onto the engine config before the first ranking. First run (no saved
+        // blob, or a corrupt one) derives them from the TOML defaults.
+        let settings = match store.get_settings_blob().await {
+            Ok(Some(blob)) => {
+                UserSettings::parse(&blob).unwrap_or_else(|| UserSettings::from_engine(&cfg.engine))
+            }
+            _ => UserSettings::from_engine(&cfg.engine),
+        };
+        settings.apply_to(&mut cfg.engine);
         let mut app = Self {
             cfg,
             ibkr,
             tab: Tab::Dashboard,
             watchlist: Vec::new(),
             suggestions: Vec::new(),
+            hedged_suggestions: Vec::new(),
             journal: Vec::new(),
             positions: Vec::new(),
             broker_positions: Vec::new(),
@@ -223,6 +259,9 @@ impl App {
             reload_pending: false,
             reload_started: None,
             offline_reason: None,
+            detail_open: false,
+            settings,
+            settings_editing: false,
             should_quit: false,
         };
         // Reconstruct rolls left in flight by a prior session; reload then
@@ -244,8 +283,20 @@ impl App {
         match self.tab {
             Tab::Watchlist => self.watchlist.len(),
             Tab::Suggestions => self.suggestions.len(),
+            Tab::HedgedWheel => self.hedged_suggestions.len(),
             Tab::Journal => self.journal.len(),
+            Tab::Settings => 2, // win-rate row + take-profit row
             _ => 0,
+        }
+    }
+
+    /// The suggestion highlighted on the active suggestions tab (Classic or
+    /// Hedged), if any. Drives the detail panel, preview, and execute.
+    pub fn selected_suggestion(&self) -> Option<&Suggestion> {
+        match self.tab {
+            Tab::Suggestions => self.suggestions.get(self.selected),
+            Tab::HedgedWheel => self.hedged_suggestions.get(self.selected),
+            _ => None,
         }
     }
 
@@ -261,12 +312,48 @@ impl App {
             };
         }
 
+        // Detail panel acts as a modal over the selected suggestion.
+        if self.detail_open {
+            return match key.code {
+                KeyCode::Esc | KeyCode::Char('b') | KeyCode::Enter => Some(Action::CloseDetail),
+                KeyCode::Char('x') => Some(Action::Execute),
+                KeyCode::Char('p') => Some(Action::Preview),
+                KeyCode::Char('A') => Some(Action::ToggleArm),
+                KeyCode::Char('q') => Some(Action::Quit),
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    Some(Action::Quit)
+                }
+                _ => None,
+            };
+        }
+
+        // The Settings tab is modal: Enter toggles "edit mode" on the selected
+        // knob. Only while editing do ↑/↓ (k/j) change its value (Enter/Esc
+        // confirm) — so otherwise arrows keep switching tabs, like every tab.
+        if self.tab == Tab::Settings {
+            if self.settings_editing {
+                return match key.code {
+                    KeyCode::Up | KeyCode::Char('k') => Some(Action::SettingAdjust(1)),
+                    KeyCode::Down | KeyCode::Char('j') => Some(Action::SettingAdjust(-1)),
+                    KeyCode::Enter | KeyCode::Esc => Some(Action::ToggleSettingEdit),
+                    KeyCode::Char('q') => Some(Action::Quit),
+                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        Some(Action::Quit)
+                    }
+                    _ => None, // swallow other keys so we never leave mid-edit
+                };
+            }
+            if key.code == KeyCode::Enter {
+                return Some(Action::ToggleSettingEdit);
+            }
+        }
+
         match key.code {
             KeyCode::Char('q') => Some(Action::Quit),
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => Some(Action::Quit),
             KeyCode::Tab | KeyCode::Right => Some(Action::NextTab),
             KeyCode::BackTab | KeyCode::Left => Some(Action::PrevTab),
-            KeyCode::Char(d @ '1'..='5') => Some(Action::JumpTab(d as usize - '1' as usize)),
+            KeyCode::Char(d @ '1'..='7') => Some(Action::JumpTab(d as usize - '1' as usize)),
             KeyCode::Char('j') | KeyCode::Down => Some(Action::Down),
             KeyCode::Char('k') | KeyCode::Up => Some(Action::Up),
             KeyCode::Char('a') => Some(Action::StartAddSymbol),
@@ -276,6 +363,9 @@ impl App {
             KeyCode::Char('A') => Some(Action::ToggleArm),
             KeyCode::Char('p') => Some(Action::Preview),
             KeyCode::Char('x') => Some(Action::Execute),
+            KeyCode::Enter if matches!(self.tab, Tab::Suggestions | Tab::HedgedWheel) => {
+                Some(Action::OpenDetail)
+            }
             _ => None,
         }
     }
@@ -290,6 +380,7 @@ impl App {
                 if let Some(t) = Tab::ALL.get(i) {
                     self.tab = *t;
                     self.selected = 0;
+                    self.settings_editing = false;
                 }
             }
             Action::Up => self.move_selection(-1),
@@ -350,25 +441,72 @@ impl App {
                 };
             }
             Action::Preview => {
-                if self.tab == Tab::Suggestions
-                    && let Some(sug) = self.suggestions.get(self.selected).cloned()
-                {
+                if let Some(sug) = self.selected_suggestion().cloned() {
                     self.preview_suggestion(&sug, store).await?;
                 }
             }
             Action::Execute => {
-                if self.tab == Tab::Suggestions
-                    && let Some(sug) = self.suggestions.get(self.selected).cloned()
-                {
+                if let Some(sug) = self.selected_suggestion().cloned() {
                     self.execute_suggestion(&sug, store).await?;
                 }
+            }
+            Action::OpenDetail => {
+                if self.selected_suggestion().is_some() {
+                    self.detail_open = true;
+                }
+            }
+            Action::CloseDetail => {
+                self.detail_open = false;
+                self.status = self.default_status();
+            }
+            Action::SettingAdjust(dir) => {
+                self.adjust_setting(dir, store).await;
+            }
+            Action::ToggleSettingEdit => {
+                self.settings_editing = !self.settings_editing;
+                self.status = if self.settings_editing {
+                    "editing — ↑/↓ change · Enter or Esc when done".into()
+                } else {
+                    format!(
+                        "win {:.0}% · take-profit {:.0}% — saved",
+                        self.settings.target_win_pct, self.settings.take_profit_pct
+                    )
+                };
             }
         }
         Ok(())
     }
 
+    /// Nudge the Settings-tab knob under the cursor, re-rank, and persist.
+    /// Row 0 = target win rate (1-point steps); row 1 = take-profit (5-point
+    /// steps). The change overlays onto `cfg.engine` so the very next reload —
+    /// live or demo — ranks against it.
+    async fn adjust_setting(&mut self, dir: i32, store: &Store) {
+        let step = dir as f64;
+        if self.selected == 0 {
+            self.settings.target_win_pct += step;
+        } else {
+            self.settings.take_profit_pct += 5.0 * step;
+        }
+        self.settings.clamp();
+        self.settings.apply_to(&mut self.cfg.engine);
+        if let Err(e) = store.put_settings_blob(&self.settings.to_blob()).await {
+            tracing::warn!("persisting settings: {e}");
+        }
+        self.status = format!(
+            "win {:.0}% · take-profit {:.0}% — saved, re-ranking…",
+            self.settings.target_win_pct, self.settings.take_profit_pct
+        );
+        self.request_reload(store).await;
+    }
+
     /// Submit a what-if for the selected suggestion; journal it; show the result.
     async fn preview_suggestion(&mut self, sug: &Suggestion, store: &Store) -> Result<()> {
+        if matches!(sug.kind, ActionKind::SellPutSpread { .. }) {
+            self.status =
+                "Hedged Wheel spread execution arrives in the next step (combo orders)".into();
+            return Ok(());
+        }
         let Some(ibkr) = self.ibkr.clone() else {
             self.status = "not connected — start IB Gateway first".into();
             return Ok(());
@@ -442,6 +580,11 @@ impl App {
     /// Transmit the selected suggestion (live order). Gated on armed +
     /// connected + not read_only; auto-disarms after a successful submission.
     async fn execute_suggestion(&mut self, sug: &Suggestion, store: &Store) -> Result<()> {
+        if matches!(sug.kind, ActionKind::SellPutSpread { .. }) {
+            self.status =
+                "Hedged Wheel spread execution arrives in the next step (combo orders)".into();
+            return Ok(());
+        }
         if !self.armed {
             self.status = "disarmed — press `A` to arm before executing".into();
             return Ok(());
@@ -981,6 +1124,7 @@ impl App {
         let i = (self.tab.index() as isize + delta).rem_euclid(n) as usize;
         self.tab = Tab::ALL[i];
         self.selected = 0;
+        self.settings_editing = false;
     }
 
     fn move_selection(&mut self, delta: isize) {
@@ -1068,7 +1212,7 @@ impl App {
                             store.symbols_with_working_orders().await.unwrap_or_default()
                         }
                     };
-                    self.suggestions = live_suggestions(
+                    let (classic, hedged) = live_suggestions(
                         &ibkr,
                         store,
                         &self.watchlist,
@@ -1078,6 +1222,8 @@ impl App {
                         today,
                     )
                     .await;
+                    self.suggestions = classic;
+                    self.hedged_suggestions = hedged;
                 }
                 Err(e) => {
                     // Positions are unknown: preserve the stored wheel state for
@@ -1189,6 +1335,7 @@ impl App {
         if d.positions_ok {
             self.broker_positions = d.broker_positions;
             self.suggestions = d.suggestions;
+            self.hedged_suggestions = d.hedged_suggestions;
             // Reconcile prior-session rolls on the loop — a no-op unless some are
             // still reconstructed. This is the stateful/transmitting path, so it
             // must never run on the background task.
@@ -1203,6 +1350,7 @@ impl App {
             }
         } else {
             self.suggestions.clear();
+            self.hedged_suggestions.clear();
             self.status = "broker positions unavailable — suggestions cleared until refresh".into();
         }
         self.positions = d.positions;
@@ -1274,6 +1422,7 @@ fn format_kind(k: &ActionKind) -> String {
         ActionKind::SellCall => "SellCall".into(),
         ActionKind::CloseForProfit => "Close".into(),
         ActionKind::Roll { .. } => "Roll".into(),
+        ActionKind::SellPutSpread { .. } => "SellPutSpread".into(),
     }
 }
 
@@ -1284,6 +1433,8 @@ fn side_and_right(sug: &Suggestion) -> Option<(Side, &'static str)> {
         (ActionKind::CloseForProfit, Right::Put) => Some((Side::Buy, "P")),
         (ActionKind::CloseForProfit, Right::Call) => Some((Side::Buy, "C")),
         (ActionKind::Roll { .. }, _) => None,
+        // A spread isn't a single-leg order; preview/execute handle it explicitly.
+        (ActionKind::SellPutSpread { .. }, _) => None,
     }
 }
 
@@ -1705,6 +1856,7 @@ mod tests {
             kind,
             right,
             strike: 100.0,
+            underlying_price: 105.0,
             expiry: NaiveDate::from_ymd_opt(2026, 6, 19).unwrap(),
             dte: 30,
             quantity: 1,

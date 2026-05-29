@@ -119,6 +119,10 @@ pub enum ActionKind {
     CloseForProfit,
     /// Defend a tested short by rolling out (and possibly down/up).
     Roll { to_expiry: NaiveDate, to_strike: f64 },
+    /// Open a defined-risk put credit spread: sell `strike`, buy `long_strike`
+    /// (further OTM) as protection. Caps max loss to the spread width minus the
+    /// net credit. The Hedged Wheel's entry.
+    SellPutSpread { long_strike: f64, long_price: f64 },
 }
 
 /// A single recommended action with everything needed to preview/execute it.
@@ -128,6 +132,9 @@ pub struct Suggestion {
     pub kind: ActionKind,
     pub right: Right,
     pub strike: f64,
+    /// Underlying spot price when this suggestion was produced. Drives the
+    /// detail panel's "P&L if the stock falls X%" scenarios; `0.0` if unknown.
+    pub underlying_price: f64,
     pub expiry: NaiveDate,
     pub dte: i64,
     pub quantity: i32,
@@ -179,6 +186,12 @@ pub struct EngineConfig {
     pub risk_free_rate: f64,
     /// Covered-call strikes must sit at least this fraction above cost basis.
     pub cc_min_pct_above_basis: f64,
+    /// Hedged Wheel: the protective long put sits at most this fraction below the
+    /// short strike (e.g. 0.05 = within 5%), capping the spread width so the hedge
+    /// stays tight rather than a far-away one that barely caps risk.
+    pub hedge_pct_below: f64,
+    /// Hedged Wheel: skip spreads whose net credit (per share) is below this.
+    pub hedge_min_credit: f64,
 }
 
 impl Default for EngineConfig {
@@ -197,6 +210,8 @@ impl Default for EngineConfig {
             min_premium: 0.05,
             risk_free_rate: 0.04,
             cc_min_pct_above_basis: 0.0,
+            hedge_pct_below: 0.05,
+            hedge_min_credit: 0.10,
         }
     }
 }

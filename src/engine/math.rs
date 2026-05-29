@@ -26,6 +26,25 @@ pub fn round_cents(x: f64) -> f64 {
     (x * 100.0).round() / 100.0
 }
 
+/// P&L at expiry of a short put, optionally hedged into a put credit spread by a
+/// long put at `long_strike`, when the underlying settles at `spot`.
+///
+/// `credit` is the per-share premium kept (the spread's *net* credit when hedged)
+/// and the result scales by `shares`. Without a hedge the loss grows unbounded as
+/// `spot → 0`; with one it is capped at `(width − credit) × shares`. Used to show
+/// concrete "what if the stock drops X%" outcomes.
+pub fn short_put_pnl_at(
+    spot: f64,
+    short_strike: f64,
+    credit: f64,
+    long_strike: Option<f64>,
+    shares: f64,
+) -> f64 {
+    let short_intrinsic = (short_strike - spot).max(0.0);
+    let long_intrinsic = long_strike.map_or(0.0, |lk| (lk - spot).max(0.0));
+    (credit - (short_intrinsic - long_intrinsic)) * shares
+}
+
 /// Standard normal CDF (Zelen & Severo approximation, |err| < 7.5e-8).
 pub fn norm_cdf(x: f64) -> f64 {
     let t = 1.0 / (1.0 + 0.231_641_9 * x.abs());
@@ -104,5 +123,31 @@ mod tests {
         assert!(bs_delta(Right::Put, 0.0, 100.0, 0.1, 0.04, 0.3).is_none());
         assert!(bs_delta(Right::Put, 100.0, 100.0, 0.0, 0.04, 0.3).is_none());
         assert!(bs_delta(Right::Put, 100.0, 100.0, 0.1, 0.04, 0.0).is_none());
+    }
+
+    #[test]
+    fn short_put_pnl_unhedged() {
+        // Sold a $100 put for $2, one contract (100 shares).
+        // Above strike → keep the full credit.
+        assert!((short_put_pnl_at(105.0, 100.0, 2.0, None, 100.0) - 200.0).abs() < 1e-9);
+        // At breakeven ($98) → ~flat.
+        assert!(short_put_pnl_at(98.0, 100.0, 2.0, None, 100.0).abs() < 1e-9);
+        // Down to $80 → (2 − 20) × 100 = −$1,800.
+        assert!((short_put_pnl_at(80.0, 100.0, 2.0, None, 100.0) + 1800.0).abs() < 1e-9);
+        // To zero → loss within $200 of the full strike notional (credit kept).
+        assert!((short_put_pnl_at(0.0, 100.0, 2.0, None, 100.0) + 9800.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn short_put_pnl_spread_caps_the_loss() {
+        // $100/$95 put spread, $1.50 net credit, one contract. Width $5.
+        let cap = -(5.0 - 1.50) * 100.0; // −$350 max loss
+        // At/above the long strike the loss keeps growing until $95...
+        assert!((short_put_pnl_at(96.0, 100.0, 1.50, Some(95.0), 100.0) + 250.0).abs() < 1e-9);
+        // ...then it plateaus: $90, $50, $0 all hit the same capped loss.
+        for spot in [95.0, 90.0, 50.0, 0.0] {
+            let pnl = short_put_pnl_at(spot, 100.0, 1.50, Some(95.0), 100.0);
+            assert!((pnl - cap).abs() < 1e-9, "spot {spot}: {pnl} != {cap}");
+        }
     }
 }
