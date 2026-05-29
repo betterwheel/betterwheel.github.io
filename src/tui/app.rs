@@ -318,6 +318,7 @@ impl App {
                     }
                 }
                 self.input = InputMode::Normal;
+                self.refresh_watchlist(store).await?;
                 self.request_reload(store).await;
             }
             Action::DeleteSelected => {
@@ -327,6 +328,7 @@ impl App {
                     let sym = row.symbol.clone();
                     store.remove_symbol(&sym).await?;
                     self.status = format!("removed {sym}");
+                    self.refresh_watchlist(store).await?;
                     self.request_reload(store).await;
                 }
             }
@@ -1101,6 +1103,17 @@ impl App {
         self.reloading
     }
 
+    /// Re-read the local watchlist into state and keep the selection in range.
+    /// Membership is local and user-driven, so add/delete must show up at once —
+    /// independent of the slower, off-loop broker refresh.
+    async fn refresh_watchlist(&mut self, store: &Store) -> Result<()> {
+        self.watchlist = store.list_watchlist().await?;
+        if self.selected >= self.list_len() {
+            self.selected = self.list_len().saturating_sub(1);
+        }
+        Ok(())
+    }
+
     /// Refresh data. When connected, the heavy broker gather runs on a spawned
     /// task and lands later via [`App::apply_live_data`], so the UI thread never
     /// blocks; offline it just recomputes demo data inline (cheap, no broker I/O).
@@ -1131,7 +1144,11 @@ impl App {
     /// the safety rule that an incomplete positions snapshot must not look empty.
     pub(super) async fn apply_live_data(&mut self, d: LiveData, store: &Store) {
         self.account = d.account;
-        self.watchlist = d.watchlist;
+        // Re-read membership on the loop instead of trusting the gather's
+        // (possibly pre-deletion) snapshot, so a delete during a slow gather
+        // can't repaint the row. The probe persisted its tradable flags, so a
+        // fresh read still reflects them.
+        self.watchlist = store.list_watchlist().await.unwrap_or(d.watchlist);
         self.journal = d.journal;
         if d.positions_ok {
             self.broker_positions = d.broker_positions;
