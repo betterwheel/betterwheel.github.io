@@ -28,9 +28,10 @@ pub fn render(frame: &mut Frame, app: &App) {
 fn render_tabs(frame: &mut Frame, app: &App, area: Rect) {
     let titles = Tab::ALL.iter().map(|t| Line::from(format!(" {} ", t.title())));
     let conn = if app.connected { "● live" } else { "○ offline" };
+    let sync = if app.is_loading() { "  ⟳ syncing" } else { "" };
     let armed = if app.armed { "  ⚡ ARMED" } else { "" };
     let title = format!(
-        "TheWheel  [{}]  {conn}  ·  {} open{armed}",
+        "TheWheel  [{}]  {conn}{sync}  ·  {} open{armed}",
         app.mode_label(),
         app.open_position_count()
     );
@@ -68,7 +69,10 @@ fn render_dashboard(frame: &mut Frame, app: &App, area: Rect) {
             money(a.total_cash),
             money(a.buying_power)
         ),
-        None => "—  (offline; start IB Gateway/TWS and set [connection] in config.toml)".into(),
+        None => match &app.offline_reason {
+            Some(r) => format!("—  ({r})"),
+            None => "—  (offline; start IB Gateway/TWS and set [connection] in config.toml)".into(),
+        },
     };
     let armed = if app.armed {
         Span::styled(
@@ -83,7 +87,16 @@ fn render_dashboard(frame: &mut Frame, app: &App, area: Rect) {
             Span::styled("Mode:        ", HEAD),
             Span::raw(format!("{}   ", app.mode_label())),
             Span::styled("Connection:  ", HEAD),
-            Span::raw(if app.connected { "live" } else { "offline / demo data" }),
+            Span::raw(if app.connected {
+                "live".to_string()
+            } else if app.cfg.connection.reconnect_secs > 0 {
+                format!(
+                    "offline / demo — retrying every {}s",
+                    app.cfg.connection.reconnect_secs
+                )
+            } else {
+                "offline / demo data".to_string()
+            }),
         ]),
         Line::from(vec![Span::styled("Account:     ", HEAD), Span::raw(acct)]),
         Line::from(vec![Span::styled("Armed:       ", HEAD), armed]),

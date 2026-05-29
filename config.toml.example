@@ -10,6 +10,7 @@ client_id  = 100          # distinct id per concurrent API client
 # account  = "DU1234567"  # paper accounts start with "DU"; discovered if omitted
 market_data = "delayed"   # realtime | frozen | delayed | delayed_frozen
                           # realtime needs an OPRA subscription; delayed is free
+reconnect_secs = 15       # retry connecting every N s while offline (0 = off)
 
 [engine]                  # wheel tuning — common r/thetagang norms
 target_delta = 0.30       # ideal short-option delta

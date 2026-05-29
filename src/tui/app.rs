@@ -15,11 +15,12 @@ use std::sync::Arc;
 use anyhow::Result;
 use chrono::{Local, NaiveDate};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use tokio::sync::mpsc;
 
 use super::demo;
 use super::live::{
-    live_suggestions, position_has_short, price_leg, probe_unknown_tradability, resolve_roll_target,
-    right_char, sync_wheel_state,
+    gather, live_suggestions, position_has_short, price_leg, probe_unknown_tradability,
+    resolve_roll_target, right_char, sync_wheel_state, LiveData,
 };
 use crate::config::{Config, TradingMode};
 use crate::engine::types::{ActionKind, Right, Suggestion, WheelState};
@@ -92,6 +93,17 @@ pub enum Action {
     Execute,
 }
 
+/// A result from an off-loop broker task, delivered to the run loop so broker
+/// I/O (reconnects, data reloads) never blocks the UI thread.
+pub(super) enum BrokerUpdate {
+    /// An auto-reconnect attempt succeeded.
+    Connected(Arc<Ibkr>),
+    /// An auto-reconnect attempt failed; carries a short UI hint.
+    ConnectFailed(String),
+    /// A background reload finished (boxed — it's a large payload).
+    Reloaded(Box<LiveData>),
+}
+
 /// All TUI state.
 pub struct App {
     pub cfg: Config,
@@ -116,6 +128,15 @@ pub struct App {
     /// Rolls whose close leg is live but not yet filled; the open leg is sent
     /// only once the matching close fills (see [`App::apply_order_event`]).
     pending_rolls: Vec<PendingRoll>,
+    /// Channel to the run loop for off-loop broker results; wired by
+    /// [`App::set_update_sender`] once the loop starts.
+    update_tx: Option<mpsc::UnboundedSender<BrokerUpdate>>,
+    /// A background reload is in flight (coalesces refresh bursts).
+    reloading: bool,
+    /// A reload was requested while one was running; run one more when it lands.
+    reload_pending: bool,
+    /// Why we're offline, shown on the dashboard; cleared once connected.
+    pub offline_reason: Option<String>,
     pub should_quit: bool,
 }
 
@@ -194,6 +215,10 @@ impl App {
             connected,
             armed: false,
             pending_rolls: Vec::new(),
+            update_tx: None,
+            reloading: false,
+            reload_pending: false,
+            offline_reason: None,
             should_quit: false,
         };
         // Reconstruct rolls left in flight by a prior session; reload then
@@ -293,7 +318,7 @@ impl App {
                     }
                 }
                 self.input = InputMode::Normal;
-                self.reload(store).await?;
+                self.request_reload(store).await;
             }
             Action::DeleteSelected => {
                 if self.tab == Tab::Watchlist
@@ -302,12 +327,11 @@ impl App {
                     let sym = row.symbol.clone();
                     store.remove_symbol(&sym).await?;
                     self.status = format!("removed {sym}");
-                    self.reload(store).await?;
+                    self.request_reload(store).await;
                 }
             }
             Action::Refresh => {
-                self.reload(store).await?;
-                self.status = "refreshed".into();
+                self.request_reload(store).await;
             }
             Action::ToggleArm => {
                 self.armed = !self.armed;
@@ -927,7 +951,7 @@ impl App {
                 // fill *or* a partial fill on a still-working status — so live
                 // exposure is never left stale; otherwise just refresh the journal.
                 if self.ibkr.is_some() && traded {
-                    self.reload(store).await?; // also reloads the journal
+                    self.request_reload(store).await; // off-loop; also reloads journal
                 } else {
                     self.journal = store.recent_journal(200).await?;
                 }
@@ -1052,6 +1076,91 @@ impl App {
             self.selected = self.list_len().saturating_sub(1);
         }
         Ok(())
+    }
+
+    /// Wire the channel the run loop uses to receive off-loop broker results.
+    pub(super) fn set_update_sender(&mut self, tx: mpsc::UnboundedSender<BrokerUpdate>) {
+        self.update_tx = Some(tx);
+    }
+
+    /// Adopt a connection established by auto-reconnect.
+    pub(super) fn set_connected(&mut self, ibkr: Arc<Ibkr>) {
+        self.ibkr = Some(ibkr);
+        self.connected = true;
+        self.offline_reason = None;
+        self.status = "connected — refreshing live data…".into();
+    }
+
+    /// Record why we're offline (shown on the dashboard).
+    pub(super) fn set_offline_reason(&mut self, reason: String) {
+        self.offline_reason = Some(reason);
+    }
+
+    /// Whether a background reload is currently in flight (drives the UI spinner).
+    pub fn is_loading(&self) -> bool {
+        self.reloading
+    }
+
+    /// Refresh data. When connected, the heavy broker gather runs on a spawned
+    /// task and lands later via [`App::apply_live_data`], so the UI thread never
+    /// blocks; offline it just recomputes demo data inline (cheap, no broker I/O).
+    pub(super) async fn request_reload(&mut self, store: &Store) {
+        let (Some(ibkr), Some(tx)) = (self.ibkr.clone(), self.update_tx.clone()) else {
+            if let Err(e) = self.reload(store).await {
+                self.status = format!("refresh failed: {e}");
+            }
+            return;
+        };
+        if self.reloading {
+            self.reload_pending = true; // coalesce: run once the in-flight one lands
+            return;
+        }
+        self.reloading = true;
+        self.status = "refreshing live data…".into();
+        let store = store.clone();
+        let cfg = self.cfg.clone();
+        let pending: Vec<String> = self.pending_rolls.iter().map(|p| p.symbol.clone()).collect();
+        tokio::spawn(async move {
+            let today = Local::now().date_naive();
+            let data = gather(&ibkr, &store, &cfg, &pending, today).await;
+            let _ = tx.send(BrokerUpdate::Reloaded(Box::new(data)));
+        });
+    }
+
+    /// Apply a finished background reload (see [`App::request_reload`]), preserving
+    /// the safety rule that an incomplete positions snapshot must not look empty.
+    pub(super) async fn apply_live_data(&mut self, d: LiveData, store: &Store) {
+        self.account = d.account;
+        self.watchlist = d.watchlist;
+        self.journal = d.journal;
+        if d.positions_ok {
+            self.broker_positions = d.broker_positions;
+            self.suggestions = d.suggestions;
+            // Reconcile prior-session rolls on the loop — a no-op unless some are
+            // still reconstructed. This is the stateful/transmitting path, so it
+            // must never run on the background task.
+            if let Some(open) = &d.open_orders {
+                let bp = self.broker_positions.clone();
+                self.reconcile_pending_rolls(open, &bp, store).await;
+            }
+            // Keep any roll status the reconcile just set; otherwise settle to the
+            // default connected status.
+            if !self.status.starts_with("roll ") {
+                self.status = self.default_status();
+            }
+        } else {
+            self.suggestions.clear();
+            self.status = "broker positions unavailable — suggestions cleared until refresh".into();
+        }
+        self.positions = d.positions;
+        if self.selected >= self.list_len() {
+            self.selected = self.list_len().saturating_sub(1);
+        }
+        self.reloading = false;
+        if self.reload_pending {
+            self.reload_pending = false;
+            self.request_reload(store).await;
+        }
     }
 
     pub fn mode_label(&self) -> &'static str {

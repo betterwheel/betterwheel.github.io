@@ -15,9 +15,9 @@ use crate::engine::types::{
     UnderlyingQuote, WheelState,
 };
 use crate::engine::{self, SymbolContext};
-use crate::ibkr::{Ibkr, PositionRow, Tradability};
+use crate::ibkr::{AccountSnapshot, Ibkr, OpenOrderInfo, PositionRow, Tradability};
 use crate::positions;
-use crate::store::{Store, WatchlistRow};
+use crate::store::{JournalRow, Store, WatchlistRow, WheelPositionRow};
 
 /// Keep only OTM strikes within this fraction of spot when building a chain
 /// (bounds how far OTM we'll quote for entries / covered calls).
@@ -26,6 +26,89 @@ const MAX_OTM_MONEYNESS: f64 = 0.15;
 const MAX_CHAIN_STRIKES: usize = 5;
 /// Far-OTM put target (fraction of spot) used by the tradability permission probe.
 const PROBE_OTM_FRACTION: f64 = 0.85;
+
+/// Everything an off-loop reload gathers from the broker + store, to be applied
+/// to the `App` back on the event loop. Mirrors the *connected* branch of
+/// `App::reload` (which stays inline, for startup only) so the heavy broker I/O
+/// — chains, snapshots, the tradability probe — never runs on the UI thread.
+pub(super) struct LiveData {
+    pub account: Option<AccountSnapshot>,
+    pub watchlist: Vec<WatchlistRow>,
+    pub journal: Vec<JournalRow>,
+    pub positions: Vec<WheelPositionRow>,
+    pub broker_positions: Vec<PositionRow>,
+    pub suggestions: Vec<Suggestion>,
+    /// Authoritative open orders, or `None` if that snapshot failed.
+    pub open_orders: Option<Vec<OpenOrderInfo>>,
+    /// `false` when the positions snapshot was incomplete: the caller must NOT
+    /// treat `broker_positions`/`suggestions` as authoritative (safety-critical —
+    /// a failed fetch must never look like "the account is empty").
+    pub positions_ok: bool,
+}
+
+/// Gather live broker + engine data off the UI thread (see [`LiveData`]).
+///
+/// `pending_roll_symbols` are folded into the "skip" set so a symbol with an
+/// in-flight roll never gets a stacked suggestion. Pending-roll *reconciliation*
+/// (stateful, can transmit) stays on the event loop in `App::apply_live_data`.
+pub(super) async fn gather(
+    ibkr: &Ibkr,
+    store: &Store,
+    cfg: &Config,
+    pending_roll_symbols: &[String],
+    today: NaiveDate,
+) -> LiveData {
+    let account = ibkr.account_summary().await.ok();
+
+    // Probe tradability for still-unknown symbols *before* planning, then refresh
+    // the watchlist so a symbol the probe blocks (PRIIPs / permissions) is left
+    // out of this pass rather than surfacing an order we can't actually place.
+    let mut watchlist = store.list_watchlist().await.unwrap_or_default();
+    probe_unknown_tradability(ibkr, store, &watchlist, today).await;
+    watchlist = store.list_watchlist().await.unwrap_or_default();
+
+    let (broker_positions, suggestions, open_orders, positions_ok) = match ibkr.positions().await {
+        Ok(positions) => {
+            sync_wheel_state(store, &positions).await;
+            // Authoritative open orders pick which symbols to skip; on a failed
+            // snapshot, fall back to the journal's "submitted" rows.
+            let (open_orders, working) = match ibkr.open_orders_snapshot().await {
+                Ok(open) => {
+                    let mut w: Vec<String> = open.iter().map(|o| o.symbol.clone()).collect();
+                    w.extend(pending_roll_symbols.iter().cloned());
+                    (Some(open), w)
+                }
+                Err(e) => {
+                    tracing::warn!("open orders unavailable ({e}); using journal fallback");
+                    let w = store.symbols_with_working_orders().await.unwrap_or_default();
+                    (None, w)
+                }
+            };
+            let suggestions =
+                live_suggestions(ibkr, store, &watchlist, &positions, &working, cfg, today).await;
+            (positions, suggestions, open_orders, true)
+        }
+        Err(e) => {
+            // Positions unknown — keep stored state, drop suggestions downstream.
+            tracing::warn!("positions fetch failed; suggestions will be cleared, stored state kept: {e}");
+            (Vec::new(), Vec::new(), None, false)
+        }
+    };
+
+    let journal = store.recent_journal(200).await.unwrap_or_default();
+    let positions = store.list_positions().await.unwrap_or_default();
+
+    LiveData {
+        account,
+        watchlist,
+        journal,
+        positions,
+        broker_positions,
+        suggestions,
+        open_orders,
+        positions_ok,
+    }
+}
 
 /// One-shot price for an option leg (used to value a roll's new leg): model
 /// price if present, else last, rounded to the cent. `None` if unpriced.
