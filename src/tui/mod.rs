@@ -45,6 +45,10 @@ pub async fn run(
     // Drive 0DTE auto-management: each tick checks whether any automated slot is
     // due to enter (a no-op unless a slot's `automate` is on and read_only is off).
     let mut scheduler = tokio::time::interval(Duration::from_secs(30));
+    // Periodically re-fetch live data while connected so the 0DTE scheduler enters
+    // on fresh strikes (and the wheel stays current) without a manual refresh.
+    // `request_reload` coalesces, so an in-flight reload isn't doubled.
+    let mut autoreload = tokio::time::interval(Duration::from_secs(180));
 
     // Off-loop broker results — auto-reconnects and background reloads report
     // here so the select! loop never blocks on broker I/O. Keeping `upd_tx` alive
@@ -130,6 +134,12 @@ pub async fn run(
                 // 0DTE auto-management pass (off the manual gate; gated on the
                 // per-slot `automate` opt-in + read_only inside).
                 app.tick_zerodte(&store).await;
+            }
+            _ = autoreload.tick() => {
+                // Keep suggestions fresh while connected (coalesced; off-loop).
+                if app.ibkr.is_some() {
+                    app.request_reload(&store).await;
+                }
             }
             _ = tick.tick() => {}              // periodic redraw
         }

@@ -538,6 +538,53 @@ impl Ibkr {
         }
     }
 
+    /// Cancel a working order by id (fire-and-forget — the terminal status arrives
+    /// on the order-activity stream). Used by the 0DTE time-stop / stop-loss to
+    /// pull the standing profit-close before submitting a marketable close.
+    pub async fn cancel_order(&self, order_id: &str) -> Result<()> {
+        let id: i32 = order_id
+            .parse()
+            .map_err(|_| anyhow!("cancel: bad order id {order_id}"))?;
+        self.client
+            .cancel_order(id, "")
+            .await
+            .map_err(|e| anyhow!("cancel {order_id}: {e}"))?;
+        Ok(())
+    }
+
+    /// Current net cost to close a combo: Σ over legs of `sign(action) × ratio ×
+    /// mid` at current prices (sold legs +, bought legs −) — i.e. what it would
+    /// cost now to buy the package back. Drives the stop-loss / time-stop checks;
+    /// errs if any leg is unpriced this cycle (the caller then skips, rather than
+    /// act on stale data).
+    pub async fn price_combo(
+        &self,
+        symbol: &str,
+        expiry_yyyymmdd: &str,
+        legs: &[ComboLeg],
+    ) -> Result<f64> {
+        let mut cost = 0.0;
+        for l in legs {
+            let snap = self
+                .option_snapshot(symbol, expiry_yyyymmdd, l.strike, l.right)
+                .await?;
+            let mid = snap
+                .comp
+                .as_ref()
+                .and_then(|c| c.option_price)
+                .or(snap.last)
+                .ok_or_else(|| {
+                    anyhow!("no price for {symbol} {:.0}{} {expiry_yyyymmdd}", l.strike, l.right)
+                })?;
+            let sign = match l.action {
+                Side::Sell => 1.0,
+                Side::Buy => -1.0,
+            };
+            cost += sign * l.ratio as f64 * mid;
+        }
+        Ok(cost)
+    }
+
     /// Consume the account-wide order-activity stream, forwarding each update as
     /// a plain [`OrderEvent`] over `tx`. Runs until the receiver is dropped.
     ///
