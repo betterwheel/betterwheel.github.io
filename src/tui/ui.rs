@@ -363,6 +363,10 @@ fn render_zerodte_quadrant(frame: &mut Frame, app: &App, area: Rect, i: usize) {
                     "[enter] details · [p] preview · [A] arm · [x] execute",
                     dim,
                 ));
+                lines.push(Line::styled(
+                    "[t] automate · [+/−] risk · [ [ / ] ] profit target",
+                    dim,
+                ));
             }
         }
         None => {

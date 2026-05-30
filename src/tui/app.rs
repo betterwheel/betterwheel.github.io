@@ -24,7 +24,7 @@ use super::live::{
     gather, live_suggestions, position_has_short, price_leg, probe_unknown_tradability,
     resolve_roll_target, right_char, structure_suggestions, sync_wheel_state, LiveData,
 };
-use crate::config::{Config, TradingMode, UserSettings};
+use crate::config::{Config, TradingMode, UserSettings, ZeroDteSettings};
 use crate::engine::types::{
     ActionKind, LegSide, Right, StructureKind, StructureLeg, Suggestion, WheelState,
 };
@@ -114,6 +114,12 @@ pub enum Action {
     SettingAdjust(i32),
     /// Enter/leave edit mode on the selected Settings-tab knob.
     ToggleSettingEdit,
+    /// Toggle the focused 0DTE slot's `automate` opt-in (the safety gate).
+    ToggleAutomate,
+    /// Adjust the focused 0DTE slot's max-risk budget (`+1`/`-1` step).
+    SlotRisk(i32),
+    /// Adjust the focused 0DTE slot's profit target (`+1`/`-1` step).
+    SlotProfit(i32),
 }
 
 /// A result from an off-loop broker task, delivered to the run loop so broker
@@ -249,6 +255,13 @@ impl App {
             _ => UserSettings::from_engine(&cfg.engine),
         };
         settings.apply_to(&mut cfg.engine);
+        // Overlay any in-app 0DTE roster edits (automate / sizing / profit target)
+        // onto the config.toml roster, mirroring the UserSettings overlay above.
+        if let Ok(Some(blob)) = store.get_zerodte_blob().await
+            && let Some(z) = ZeroDteSettings::parse(&blob)
+        {
+            z.apply_to(&mut cfg.zerodte);
+        }
         let mut app = Self {
             cfg,
             ibkr,
@@ -402,6 +415,13 @@ impl App {
             KeyCode::Enter if matches!(self.tab, Tab::Suggestions | Tab::HedgedWheel | Tab::ZeroDte) => {
                 Some(Action::OpenDetail)
             }
+            // 0DTE-tab live edits of the focused slot (persisted): the automate
+            // opt-in and the sizing / profit-target knobs.
+            KeyCode::Char('t') if self.tab == Tab::ZeroDte => Some(Action::ToggleAutomate),
+            KeyCode::Char('+' | '=') if self.tab == Tab::ZeroDte => Some(Action::SlotRisk(1)),
+            KeyCode::Char('-' | '_') if self.tab == Tab::ZeroDte => Some(Action::SlotRisk(-1)),
+            KeyCode::Char(']') if self.tab == Tab::ZeroDte => Some(Action::SlotProfit(1)),
+            KeyCode::Char('[') if self.tab == Tab::ZeroDte => Some(Action::SlotProfit(-1)),
             _ => None,
         }
     }
@@ -498,6 +518,9 @@ impl App {
             Action::SettingAdjust(dir) => {
                 self.adjust_setting(dir, store).await;
             }
+            Action::ToggleAutomate => self.toggle_slot_automate(store).await,
+            Action::SlotRisk(dir) => self.adjust_slot_risk(dir, store).await,
+            Action::SlotProfit(dir) => self.adjust_slot_profit(dir, store).await,
             Action::ToggleSettingEdit => {
                 self.settings_editing = !self.settings_editing;
                 self.status = if self.settings_editing {
@@ -534,6 +557,78 @@ impl App {
             self.settings.target_win_pct, self.settings.take_profit_pct
         );
         self.request_reload(store).await;
+    }
+
+    /// The roster index behind the focused 0DTE quadrant (`self.selected` is the
+    /// quadrant on that tab).
+    fn focused_slot_index(&self) -> Option<usize> {
+        self.cfg.zerodte.slots.get(self.selected).copied()
+    }
+
+    /// Persist the live 0DTE roster edits (a full snapshot of the editable fields).
+    async fn persist_zerodte(&self, store: &Store) {
+        let blob = ZeroDteSettings::snapshot(&self.cfg.zerodte).to_blob();
+        if let Err(e) = store.put_zerodte_blob(&blob).await {
+            tracing::warn!("persisting 0DTE settings: {e}");
+        }
+    }
+
+    /// Toggle the focused slot's `automate` opt-in — the deliberate, persisted gate
+    /// that lets the scheduler trade it unattended. Refuses under `read_only` and
+    /// for an un-permissioned naked structure.
+    async fn toggle_slot_automate(&mut self, store: &Store) {
+        let Some(idx) = self.focused_slot_index() else { return };
+        if self.cfg.guardrails.read_only {
+            self.status = "read_only — disable it in config to allow automation".into();
+            return;
+        }
+        // Mutate within a scope so the &mut borrow ends before we persist (&self).
+        let outcome = {
+            let Some(p) = self.cfg.zerodte.strategies.get_mut(idx) else { return };
+            if p.kind.is_naked() && !p.allow_naked {
+                Err(format!("{}: naked structure needs allow_naked in config first", p.name))
+            } else {
+                p.automate = !p.automate;
+                Ok((p.name.clone(), p.automate))
+            }
+        };
+        match outcome {
+            Err(msg) => self.status = msg,
+            Ok((name, on)) => {
+                self.persist_zerodte(store).await;
+                self.status = if on {
+                    format!("⚡ {name} AUTO-TRADING — it will enter at its scheduled time")
+                } else {
+                    format!("{name} automation off")
+                };
+            }
+        }
+    }
+
+    /// Adjust the focused slot's max-risk budget (±$250/step) and re-rank (sizing
+    /// depends on it).
+    async fn adjust_slot_risk(&mut self, dir: i32, store: &Store) {
+        let Some(idx) = self.focused_slot_index() else { return };
+        let edited = {
+            let Some(p) = self.cfg.zerodte.strategies.get_mut(idx) else { return };
+            p.max_risk = (p.max_risk + dir as f64 * 250.0).clamp(250.0, 1_000_000.0);
+            (p.name.clone(), p.max_risk)
+        };
+        self.persist_zerodte(store).await;
+        self.status = format!("{} max risk ${:.0} — re-ranking…", edited.0, edited.1);
+        self.request_reload(store).await;
+    }
+
+    /// Adjust the focused slot's profit target (±5%/step).
+    async fn adjust_slot_profit(&mut self, dir: i32, store: &Store) {
+        let Some(idx) = self.focused_slot_index() else { return };
+        let edited = {
+            let Some(p) = self.cfg.zerodte.strategies.get_mut(idx) else { return };
+            p.profit_target_pct = (p.profit_target_pct + dir as f64 * 0.05).clamp(0.05, 0.95);
+            (p.name.clone(), p.profit_target_pct)
+        };
+        self.persist_zerodte(store).await;
+        self.status = format!("{} profit target {:.0}%", edited.0, edited.1 * 100.0);
     }
 
     /// Submit a what-if for the selected suggestion; journal it; show the result.
@@ -2082,6 +2177,29 @@ mod tests {
         // The grid draws the flagship condor and the prominent risk metric.
         assert!(text.contains("Iron Condor"), "0DTE tab missing Iron Condor title");
         assert!(text.contains("max loss"), "0DTE tab missing risk metrics");
+    }
+
+    #[tokio::test]
+    async fn zerodte_automate_toggle_persists_across_restart() {
+        let store = Store::open_in_memory().await.unwrap();
+        let mut app = offline_app(&store).await;
+        app.tab = Tab::ZeroDte;
+        app.selected = 0; // focus the first quadrant (Iron Condor)
+        assert_eq!(app.zerodte_automating(), 0);
+
+        // Toggle automation on through the real dispatch path.
+        app.dispatch(Action::ToggleAutomate, &store).await.unwrap();
+        assert!(app.cfg.zerodte.strategies[0].automate);
+        assert_eq!(app.zerodte_automating(), 1);
+
+        // A fresh App from the same store restores it (the persisted overlay).
+        let app2 = offline_app(&store).await;
+        assert!(app2.cfg.zerodte.strategies[0].automate, "automate not restored");
+        assert_eq!(app2.zerodte_automating(), 1);
+
+        // Sizing edits persist too and re-rank without panicking.
+        app.dispatch(Action::SlotRisk(2), &store).await.unwrap(); // +$500
+        assert!((app.cfg.zerodte.strategies[0].max_risk - 4000.0).abs() < 1e-9);
     }
 
     // --- shared test helpers ---

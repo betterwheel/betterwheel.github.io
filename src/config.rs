@@ -275,6 +275,68 @@ impl ZeroDteConfig {
     }
 }
 
+/// Live, in-app overrides for the 0DTE roster — the subset of slot params
+/// editable from the 0DTE tab (the safety-critical `automate` opt-in plus sizing
+/// and profit target). Persisted to the store and overlaid onto the config.toml
+/// roster at startup, mirroring how [`UserSettings`] overrides `[engine]`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ZeroDteSettings {
+    #[serde(rename = "override")]
+    pub overrides: Vec<SlotOverride>,
+}
+
+/// One roster slot's in-app overrides, keyed by roster index.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SlotOverride {
+    pub index: usize,
+    pub automate: bool,
+    pub max_risk: f64,
+    pub profit_target_pct: f64,
+}
+
+impl ZeroDteSettings {
+    /// Snapshot the editable fields of every roster slot, so persisting after a
+    /// single edit captures the whole live state.
+    pub fn snapshot(cfg: &ZeroDteConfig) -> Self {
+        Self {
+            overrides: cfg
+                .strategies
+                .iter()
+                .enumerate()
+                .map(|(index, p)| SlotOverride {
+                    index,
+                    automate: p.automate,
+                    max_risk: p.max_risk,
+                    profit_target_pct: p.profit_target_pct,
+                })
+                .collect(),
+        }
+    }
+
+    /// Overlay the saved edits onto a roster by index; out-of-range entries are
+    /// ignored, so a shrunk roster is safe.
+    pub fn apply_to(&self, cfg: &mut ZeroDteConfig) {
+        for o in &self.overrides {
+            if let Some(p) = cfg.strategies.get_mut(o.index) {
+                p.automate = o.automate;
+                p.max_risk = o.max_risk;
+                p.profit_target_pct = o.profit_target_pct;
+            }
+        }
+    }
+
+    /// Parse a persisted blob; malformed input falls back to no overrides.
+    pub fn parse(blob: &str) -> Option<Self> {
+        toml::from_str(blob).ok()
+    }
+
+    /// Serialize for persistence.
+    pub fn to_blob(&self) -> String {
+        toml::to_string(self).unwrap_or_default()
+    }
+}
+
 impl Config {
     /// Load config from `path`. A missing file yields defaults.
     pub fn load(path: &Path) -> anyhow::Result<Config> {
@@ -370,5 +432,29 @@ short_delta = 0.10
         assert_eq!(cfg.zerodte.strategies[0].kind, StructureKind::IronCondor);
         // A defaulted field still carries the StructureParams default.
         assert_eq!(cfg.zerodte.strategies[0].profit_target_pct, 0.40);
+    }
+
+    #[test]
+    fn zerodte_overrides_roundtrip_and_apply() {
+        let mut cfg = ZeroDteConfig::default();
+        // Simulate in-app edits: automate slot 0, retune its sizing/profit.
+        cfg.strategies[0].automate = true;
+        cfg.strategies[0].max_risk = 4000.0;
+        cfg.strategies[0].profit_target_pct = 0.25;
+
+        let blob = ZeroDteSettings::snapshot(&cfg).to_blob();
+        let parsed = ZeroDteSettings::parse(&blob).expect("roundtrip");
+
+        // Applying onto a fresh (config.toml) roster restores the live edits, while
+        // leaving non-overlaid fields (delta, wings) from the config.
+        let mut fresh = ZeroDteConfig::default();
+        assert!(!fresh.strategies[0].automate);
+        parsed.apply_to(&mut fresh);
+        assert!(fresh.strategies[0].automate);
+        assert_eq!(fresh.strategies[0].max_risk, 4000.0);
+        assert_eq!(fresh.strategies[0].profit_target_pct, 0.25);
+        assert_eq!(fresh.strategies[0].short_delta, 0.13); // untouched, from config
+        // Garbage falls back gracefully.
+        assert!(ZeroDteSettings::parse("== not toml ==").is_none());
     }
 }
