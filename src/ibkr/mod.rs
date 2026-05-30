@@ -26,6 +26,52 @@ pub struct Ibkr {
     client: Arc<Client>,
 }
 
+/// Cash-settled index underlyings whose options the 0DTE strategies target.
+/// These resolve as `SecurityType::Index` (CBOE/…), not as stocks.
+fn is_index_symbol(symbol: &str) -> bool {
+    matches!(
+        symbol,
+        "SPX" | "SPXW" | "NDX" | "RUT" | "DJI" | "VIX" | "XSP" | "XND"
+    )
+}
+
+/// The underlying contract for `symbol`: an index contract for the recognized
+/// indices, otherwise a stock. Used by the chain/snapshot/conid resolvers so the
+/// 0DTE path can quote SPX while the wheel keeps quoting stocks.
+fn underlying_contract(symbol: &str) -> Contract {
+    if is_index_symbol(symbol) {
+        Contract::index(symbol)
+    } else {
+        Contract::stock(symbol).build()
+    }
+}
+
+/// The underlying security type for an option-chain (secDefOptParams) request.
+fn underlying_sec_type(symbol: &str) -> SecurityType {
+    if is_index_symbol(symbol) {
+        SecurityType::Index
+    } else {
+        SecurityType::Stock
+    }
+}
+
+/// Minimum order price increment for `symbol`'s options. Index options (SPX, …)
+/// tick in $0.05; equities and their options in $0.01. Submitting a price off the
+/// tick gets IBKR error 110 ("price doesn't respect the minimum variation") and
+/// the what-if/order never resolves. A coarse default — IBKR's true `min_tick`
+/// comes from contract details — but it covers the indices we trade.
+fn order_tick(symbol: &str) -> f64 {
+    if is_index_symbol(symbol) { 0.05 } else { 0.01 }
+}
+
+/// Round `price` to the nearest `tick` (no-op for a non-positive tick).
+fn round_to_tick(price: f64, tick: f64) -> f64 {
+    if tick <= 0.0 {
+        return price;
+    }
+    (price / tick).round() * tick
+}
+
 /// Turn a [`Ibkr::connect`] failure into a short, actionable hint for the UI.
 ///
 /// The disclaimer case is a heuristic: on a paper account, Gateway *resets the
@@ -184,8 +230,9 @@ impl Ibkr {
     }
 
     /// Resolve the underlying's IBKR contract id (needed for the option chain).
+    /// Index underlyings (SPX, NDX, …) resolve as `SecurityType::Index`, not stock.
     pub async fn underlying_contract_id(&self, symbol: &str) -> Result<i32> {
-        let contract = Contract::stock(symbol).build();
+        let contract = underlying_contract(symbol);
         let details = self
             .client
             .contract_details(&contract)
@@ -222,25 +269,45 @@ impl Ibkr {
     }
 
     /// Option-chain metadata (expirations + strikes) for an underlying.
+    ///
+    /// `reqSecDefOptParams` returns one entry per (exchange, **trading class**).
+    /// For an index this matters: SPX's daily/weekly expiries live under a
+    /// *separate* class (`SPXW`) from the monthly (`SPX`), so taking only the
+    /// first entry misses every 0DTE expiry. We collect the whole stream and
+    /// **union** the expirations and strikes across classes.
     pub async fn option_chain(&self, symbol: &str, underlying_conid: i32) -> Result<ChainMeta> {
+        use std::collections::BTreeSet;
         let mut sub = self
             .client
-            .option_chain(symbol, "", SecurityType::Stock, underlying_conid)
+            .option_chain(symbol, "", underlying_sec_type(symbol), underlying_conid)
             .await
             .map_err(|e| anyhow!("option_chain {symbol}: {e}"))?;
 
-        // The first result (typically the SMART aggregate) is enough here.
-        let mut meta: Option<ChainMeta> = None;
+        let mut exps: BTreeSet<String> = BTreeSet::new();
+        let mut strikes: Vec<f64> = Vec::new();
+        let mut base: Option<ChainMeta> = None;
+        // Loop ends when the stream delivers its End marker; the timeout is only a
+        // backstop so a missing end-marker can't hang the caller.
         let _ = timeout(Duration::from_secs(15), async {
             while let Some(item) = sub.next().await {
                 if let Ok(chain) = item {
-                    meta = Some(ChainMeta::from(chain));
-                    break;
+                    let cm = ChainMeta::from(chain);
+                    exps.extend(cm.expirations.iter().cloned());
+                    strikes.extend(cm.strikes.iter().copied());
+                    if base.is_none() {
+                        base = Some(cm);
+                    }
                 }
             }
         })
         .await;
-        meta.ok_or_else(|| anyhow!("no option chain returned for {symbol}"))
+
+        let mut meta = base.ok_or_else(|| anyhow!("no option chain returned for {symbol}"))?;
+        strikes.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        strikes.dedup_by(|a, b| (*a - *b).abs() < 1e-9);
+        meta.expirations = exps.into_iter().collect();
+        meta.strikes = strikes;
+        Ok(meta)
     }
 
     /// Snapshot greeks + price for one option contract.
@@ -259,9 +326,9 @@ impl Ibkr {
             .await
     }
 
-    /// Snapshot the underlying's price.
+    /// Snapshot the underlying's price (index-aware, like the contract resolver).
     pub async fn underlying_snapshot(&self, symbol: &str) -> Result<SnapshotData> {
-        let contract = Contract::stock(symbol).build();
+        let contract = underlying_contract(symbol);
         self.collect_snapshot(&contract, &[], Duration::from_secs(8))
             .await
     }
@@ -385,6 +452,71 @@ impl Ibkr {
 
         // Credit convention: buy the package at a negative net price = receive credit.
         let combo_limit = -order.net_credit;
+        let ready = self
+            .client
+            .order(&contract)
+            .buy(order.quantity)
+            .limit(combo_limit)
+            .day_order();
+        if preview {
+            let state = timeout(Duration::from_secs(10), ready.analyze())
+                .await
+                .map_err(|_| anyhow!("preview {order}: timed out (is the Gateway API read-only?)"))?
+                .map_err(|e| anyhow!("preview {order}: {e}"))?;
+            Ok(OrderOutcome::Preview(Box::new(state)))
+        } else {
+            let id = ready
+                .submit()
+                .await
+                .map_err(|e| anyhow!("submit {order}: {e}"))?;
+            Ok(OrderOutcome::Submitted(id.0.to_string()))
+        }
+    }
+
+    /// Submit (transmit) or preview (what-if) an **N-leg combo** (BAG) order — the
+    /// 0DTE structures' entry. Generalizes [`Self::submit_or_preview_spread`] to
+    /// any number of legs (iron condor, broken-wing fly with a ratio-2 body, …).
+    ///
+    /// Each leg's `action` already encodes how the package trades, so the BAG is
+    /// built from the legs as given and the whole package is **bought** at a
+    /// negative limit (`-net_credit`) per IBKR's credit convention — buying a
+    /// net-short package opens it for a credit. A guaranteed (default) combo fills
+    /// all legs atomically or not at all, which is exactly what a defined-risk
+    /// entry wants. Always preview against a live Gateway and sanity-check the
+    /// returned margin (≈ the structure's max loss) before any live submit.
+    pub async fn submit_or_preview_combo(
+        &self,
+        order: &ComboOrder<'_>,
+        preview: bool,
+    ) -> Result<OrderOutcome> {
+        if order.legs.len() < 2 {
+            return Err(anyhow!("combo {} needs >= 2 legs", order.symbol));
+        }
+        // Combo legs are keyed by contract id, so resolve each leg first, then add
+        // it to the BAG with its ratio and exchange (SMART, like the spread path).
+        let mut builder = Contract::spread();
+        for leg in order.legs {
+            let id = self
+                .option_contract_id(order.symbol, order.expiry_yyyymmdd, leg.strike, leg.right)
+                .await?;
+            let action = match leg.action {
+                Side::Buy => LegAction::Buy,
+                Side::Sell => LegAction::Sell,
+            };
+            builder = builder
+                .add_leg(id, action)
+                .ratio(leg.ratio.max(1))
+                .on_exchange("SMART")
+                .done();
+        }
+        let mut contract = builder
+            .build()
+            .map_err(|e| anyhow!("build combo {}: {e}", order.symbol))?;
+        contract.symbol = order.symbol.into();
+
+        // Round to the instrument tick — an off-tick combo limit (e.g. -4.02 on
+        // SPX's 0.05 grid) is rejected with error 110 and the request hangs.
+        let combo_limit = round_to_tick(-order.net_credit, order_tick(order.symbol));
         let ready = self
             .client
             .order(&contract)
@@ -627,7 +759,7 @@ pub enum Tradability {
 }
 
 /// Order side for [`Ibkr::submit_or_preview`].
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Side {
     Buy,
     Sell,
@@ -695,6 +827,45 @@ impl std::fmt::Display for SpreadOrder<'_> {
             self.symbol,
             self.short_strike,
             self.long_strike,
+            self.expiry_yyyymmdd,
+            self.net_credit
+        )
+    }
+}
+
+/// One leg of an [`ComboOrder`]: a strike + right traded a given way, with a
+/// ratio (e.g. 2 for a butterfly body). Right is an IBKR code (`"P"`/`"C"`).
+#[derive(Debug, Clone, Copy)]
+pub struct ComboLeg {
+    pub strike: f64,
+    pub right: &'static str,
+    pub action: Side,
+    pub ratio: i32,
+}
+
+/// An N-leg combo (BAG) order — the 0DTE structures' entry. The legs already
+/// encode the package's shape; the whole thing is bought at `-net_credit`
+/// (IBKR credit convention). Borrows its strings like [`SpreadOrder`].
+#[derive(Debug, Clone, Copy)]
+pub struct ComboOrder<'a> {
+    pub symbol: &'a str,
+    /// Expiry as `YYYYMMDD` (all legs share it).
+    pub expiry_yyyymmdd: &'a str,
+    pub legs: &'a [ComboLeg],
+    pub quantity: i32,
+    /// Net credit per share to receive (positive); submitted as a negative combo
+    /// limit.
+    pub net_credit: f64,
+}
+
+impl std::fmt::Display for ComboOrder<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "BUY {}x {} {}-leg combo {} @{:.2}cr",
+            self.quantity,
+            self.symbol,
+            self.legs.len(),
             self.expiry_yyyymmdd,
             self.net_credit
         )

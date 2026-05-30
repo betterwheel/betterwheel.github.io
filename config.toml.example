@@ -38,3 +38,71 @@ max_total_deployed = 50000.0   # cap on total CSP collateral deployed
 max_contracts_per_order = 10
 require_live_confirmation = true  # type a phrase before live trading
 read_only = false                 # true disables all order transmits
+
+# -----------------------------------------------------------------------------
+# 0DTE / short-dated index structures (the "0DTE" tab — a 2x2 grid of slots).
+# Each [[zerodte.strategy]] is a named, parameterized structure; `slots` picks
+# which roster entries (by 0-based index) the four quadrants display. Omit the
+# whole section to use the four seeded defaults below. SPX is a cash-settled
+# index — verify your account can trade it (the app probes tradability).
+#
+# kind: IronCondor | PutCreditSpread | CallCreditSpread | BrokenWingButterfly
+#       | IronFly | ShortStrangle (naked — needs allow_naked + a naked tier)
+# Management defaults follow the thread: take profit at 25-50%, and "the wings
+# are the stop" (stop_loss_mult = 0) except on the directional spread.
+# automate = false keeps every slot preview-only until you opt it in per-slot.
+
+[zerodte]
+slots = [0, 1, 2, 3]      # quadrant -> roster index (top-left, top-right, …)
+
+[[zerodte.strategy]]
+name = "Iron Condor"
+kind = "IronCondor"
+underlying = "SPX"
+dte = 0
+short_delta = 0.13        # put-side short delta
+call_delta = 0.13         # call-side short delta (0 = reuse short_delta)
+wing_points = 25.0        # protective wing width, in index points
+delta_tol = 0.08          # acceptable band around the target delta
+min_credit = 0.80         # skip if net credit/share is below this
+max_risk = 3500.0         # size so the defined max loss stays within this ($) — SPX wings are wide
+entry_minutes_after_open = 45
+profit_target_pct = 0.40  # buy-to-close at 40% of the credit
+stop_loss_mult = 0.0      # 0 = no stop (the wings are the stop)
+# time_stop_hhmm = "15:30"  # optional force-close time (US/Eastern)
+meic_interval_min = 0     # >0 repeats entries every N min (MEIC mode)
+automate = false          # per-slot opt-in for live auto-trading
+allow_naked = false
+
+[[zerodte.strategy]]
+name = "Put Credit Spread"
+kind = "PutCreditSpread"
+dte = 1
+short_delta = 0.11
+wing_points = 10.0
+min_credit = 0.30
+max_risk = 1500.0
+entry_minutes_after_open = 45
+profit_target_pct = 0.40
+stop_loss_mult = 1.2      # close at 1.2x the credit (the thread's 120% SL)
+
+[[zerodte.strategy]]
+name = "Broken-Wing Fly"
+kind = "BrokenWingButterfly"
+dte = 0
+short_delta = 0.32        # body (2 short puts) — near the money so the fly nets a credit
+wing_points = 10.0        # narrow (upper) wing; lower wing is 3x this (skip-strike)
+min_credit = 0.10
+max_risk = 2000.0
+entry_minutes_after_open = 30
+profit_target_pct = 0.50
+
+[[zerodte.strategy]]
+name = "Iron Fly"
+kind = "IronFly"
+dte = 0
+wing_points = 30.0
+min_credit = 2.00
+max_risk = 2500.0
+entry_minutes_after_open = 30
+profit_target_pct = 0.25

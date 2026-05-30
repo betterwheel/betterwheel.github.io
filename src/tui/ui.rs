@@ -5,7 +5,8 @@ use ratatui::widgets::{Block, Cell, Clear, Paragraph, Row, Table, Tabs, Wrap};
 
 use super::app::{App, InputMode, Tab};
 use crate::engine::math::short_put_pnl_at;
-use crate::engine::types::{ActionKind, Right, Suggestion};
+use crate::engine::structures;
+use crate::engine::types::{ActionKind, LegSide, Right, Suggestion};
 
 const SEL: Style = Style::new().fg(Color::Black).bg(Color::Cyan);
 const HEAD: Style = Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD);
@@ -21,6 +22,7 @@ pub fn render(frame: &mut Frame, app: &App) {
         Tab::Watchlist => render_watchlist(frame, app, mid),
         Tab::Suggestions => render_suggestions(frame, app, mid),
         Tab::HedgedWheel => render_hedged_suggestions(frame, app, mid),
+        Tab::ZeroDte => render_zerodte(frame, app, mid),
         Tab::Journal => render_journal(frame, app, mid),
         Tab::Settings => render_settings(frame, app, mid),
         Tab::Help => render_help(frame, mid),
@@ -245,6 +247,137 @@ fn render_suggestion_table(
     );
 }
 
+/// The 0DTE tab: a 2×2 grid of strategy quadrants, one per configured slot. Each
+/// shows the slot's current structure (legs, credit, max loss, breakevens, POP)
+/// and its automation state. The focused quadrant is `app.selected`.
+fn render_zerodte(frame: &mut Frame, app: &App, area: Rect) {
+    if app.cfg.zerodte.slot_count() == 0 {
+        frame.render_widget(
+            Paragraph::new(
+                "No 0DTE strategies configured. Add [[zerodte.strategy]] entries to config.toml.",
+            )
+            .block(Block::bordered().title(" 0DTE "))
+            .wrap(Wrap { trim: true }),
+            area,
+        );
+        return;
+    }
+    let [top, bottom] =
+        Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(area);
+    let [q0, q1] =
+        Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(top);
+    let [q2, q3] =
+        Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(bottom);
+    for (i, rect) in [q0, q1, q2, q3].into_iter().enumerate() {
+        render_zerodte_quadrant(frame, app, rect, i);
+    }
+}
+
+/// One quadrant of the 0DTE grid: the structure assigned to slot `i`.
+fn render_zerodte_quadrant(frame: &mut Frame, app: &App, area: Rect, i: usize) {
+    let focused = app.tab == Tab::ZeroDte && app.selected == i;
+    let border = if focused && app.armed {
+        Style::new().fg(Color::Red).add_modifier(Modifier::BOLD)
+    } else if focused {
+        Style::new().fg(Color::Cyan)
+    } else {
+        Style::new().fg(Color::DarkGray)
+    };
+
+    let Some(params) = app.cfg.zerodte.slot(i) else {
+        let block = Block::bordered()
+            .border_style(border)
+            .title(format!(" slot {} — empty ", i + 1));
+        frame.render_widget(Paragraph::new("").block(block), area);
+        return;
+    };
+
+    // Title: name + underlying/DTE, with a loud AUTO badge when the slot is armed
+    // for unattended trading.
+    let auto = if params.automate {
+        Span::styled(" ⚡AUTO ", Style::new().fg(Color::Red).add_modifier(Modifier::BOLD))
+    } else {
+        Span::styled(" manual ", Style::new().fg(Color::DarkGray))
+    };
+    let title = Line::from(vec![
+        Span::styled(
+            format!(" {} · {} {}DTE ", params.name, params.underlying, params.dte),
+            if focused { HEAD } else { Style::new().fg(Color::Gray) },
+        ),
+        auto,
+    ]);
+
+    let dim = Style::new().fg(Color::DarkGray);
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    match app.zerodte_suggestions.get(i).and_then(|o| o.as_ref()) {
+        Some(s) => {
+            lines.push(Line::from(vec![
+                Span::styled("credit ", HEAD),
+                Span::styled(format!("${:.0}", s.premium_total), Style::new().fg(Color::Green)),
+                Span::raw("   "),
+                Span::styled("max loss ", HEAD),
+                Span::styled(format!("${:.0}", s.capital_required), Style::new().fg(Color::Red)),
+                Span::styled(format!("   ×{}", s.quantity), dim),
+            ]));
+            if let ActionKind::OpenStructure { kind, legs } = &s.kind {
+                let bes = structures::breakevens(legs);
+                let be = match bes.as_slice() {
+                    [lo, .., hi] => format!("{lo:.0}–{hi:.0}"),
+                    [b] => format!("{b:.0}"),
+                    [] => "—".into(),
+                };
+                let pop = kind
+                    .pop_is_meaningful()
+                    .then(|| structures::estimate_pop(legs))
+                    .flatten()
+                    .map(|p| format!("  ·  est win ~{:.0}%", p * 100.0))
+                    .unwrap_or_default();
+                lines.push(Line::styled(
+                    format!("breakeven {be}  ·  ror {:.0}%{pop}", s.annualized_yield * 100.0),
+                    dim,
+                ));
+                lines.push(Line::from(""));
+                for leg in legs.iter() {
+                    let (label, st) = match leg.side {
+                        LegSide::Sell => ("sell", Style::new().fg(Color::Yellow)),
+                        LegSide::Buy => ("buy ", dim),
+                    };
+                    let r = match leg.right {
+                        Right::Put => "P",
+                        Right::Call => "C",
+                    };
+                    lines.push(Line::styled(
+                        format!("  {label} {:.0}{r} @ {:.2}", leg.strike, leg.price),
+                        st,
+                    ));
+                }
+            }
+            if focused {
+                lines.push(Line::from(""));
+                lines.push(Line::styled(
+                    "[enter] details · [p] preview · [A] arm · [x] execute",
+                    dim,
+                ));
+            }
+        }
+        None => {
+            if let Some(d) = app.loading_elapsed() {
+                lines.push(Line::styled(format!("⟳ syncing… {}s", d.as_secs()), Style::new().fg(Color::Yellow)));
+            } else {
+                lines.push(Line::styled("no structure fits right now", dim));
+                lines.push(Line::styled("(tune delta / credit / max_risk, or 'r' to refresh)", dim));
+            }
+        }
+    }
+
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(Block::bordered().border_style(border).title(title))
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
 /// A `pct_x` × `pct_y` percent rectangle centered in `area`, for modal popups.
 fn centered_rect(pct_x: u16, pct_y: u16, area: Rect) -> Rect {
     let [_, v, _] = Layout::vertical([
@@ -270,6 +403,7 @@ fn action_title(kind: &ActionKind) -> &'static str {
         ActionKind::CloseForProfit => "Close for Profit",
         ActionKind::Roll { .. } => "Roll (defend)",
         ActionKind::SellPutSpread { .. } => "Put Credit Spread",
+        ActionKind::OpenStructure { kind, .. } => kind.label(),
     }
 }
 
@@ -538,6 +672,77 @@ fn suggestion_detail_lines(s: &Suggestion, app: &App) -> Vec<Line<'static>> {
                 shares as f64,
             ));
         }
+        ActionKind::OpenStructure { kind, legs } => {
+            lines.push(Line::from(format!(
+                "OPEN {qty} {} {}, expiring {} ({}d).",
+                s.symbol,
+                kind.label(),
+                s.expiry,
+                s.dte
+            )));
+            lines.push(Line::styled(
+                "A short-dated, market-neutral premium structure — opened and closed within the trade's life.",
+                dim,
+            ));
+            if kind.is_naked() {
+                lines.push(Line::styled(
+                    "⚠ NAKED — undefined risk; a gap through a short strike can be ruinous.",
+                    Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
+                ));
+            }
+            lines.push(Line::from(""));
+            for leg in legs.iter() {
+                let side = match leg.side {
+                    LegSide::Buy => "BUY ",
+                    LegSide::Sell => "SELL",
+                };
+                let r = match leg.right {
+                    Right::Put => "P",
+                    Right::Call => "C",
+                };
+                lines.push(Line::from(format!(
+                    "  {side}  ${:.0}{r}  @ ${:.2}",
+                    leg.strike, leg.price
+                )));
+            }
+            lines.push(Line::from(""));
+            lines.push(Line::from(format!(
+                "  Net credit    ${prem:.0}   (${:.2}/sh × 100 × {qty})",
+                s.limit_price
+            )));
+            if kind.is_naked() {
+                lines.push(Line::from(format!(
+                    "  Max risk      ${:.0}   (NAKED — effectively uncapped on a gap)",
+                    s.capital_required
+                )));
+            } else {
+                lines.push(Line::from(format!(
+                    "  Max loss      ${:.0}   (CAPPED by the wings)",
+                    s.capital_required
+                )));
+            }
+            let bes = structures::breakevens(legs);
+            match bes.as_slice() {
+                [lo, .., hi] => lines.push(Line::from(format!(
+                    "  Breakevens    ${lo:.0}  /  ${hi:.0}"
+                ))),
+                [be] => lines.push(Line::from(format!("  Breakeven     ${be:.0}"))),
+                [] => {}
+            }
+            if kind.pop_is_meaningful()
+                && let Some(p) = structures::estimate_pop(legs)
+            {
+                lines.push(Line::from(format!(
+                    "  Est. win      ~{:.0}%   (from the short legs' deltas)",
+                    p * 100.0
+                )));
+            }
+            lines.push(Line::from(""));
+            lines.push(Line::styled(
+                "Manage mechanically: take profit at the slot's target; let the wings be the stop.",
+                good,
+            ));
+        }
     }
 
     lines.push(Line::from(""));
@@ -594,7 +799,7 @@ fn render_journal(frame: &mut Frame, app: &App, area: Rect) {
 fn render_help(frame: &mut Frame, area: Rect) {
     let lines = vec![
         Line::from(Span::styled("Navigation", HEAD)),
-        Line::from("  Tab / → / ←      switch tabs        1–7   jump to tab"),
+        Line::from("  Tab / → / ←      switch tabs        1–8   jump to tab"),
         Line::from("  j / k  or ↑ / ↓  move selection"),
         Line::from(""),
         Line::from(Span::styled("Settings tab", HEAD)),
@@ -725,6 +930,7 @@ fn action_label(k: &ActionKind) -> &'static str {
         ActionKind::CloseForProfit => "Close",
         ActionKind::Roll { .. } => "Roll",
         ActionKind::SellPutSpread { .. } => "Put Spread",
+        ActionKind::OpenStructure { kind, .. } => kind.label(),
     }
 }
 
