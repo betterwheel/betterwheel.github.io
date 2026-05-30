@@ -48,14 +48,19 @@ fn render_tabs(frame: &mut Frame, app: &App, area: Rect) {
         None => String::new(),
     };
     let armed = if app.armed { "  ⚡ ARMED" } else { "" };
+    let auto = match app.zerodte_automating() {
+        0 => String::new(),
+        n => format!("  ⚡ {n} AUTO-TRADING"),
+    };
     let title = format!(
-        "TheWheel  [{}]  {conn}{sync}  ·  {} open{armed}",
+        "TheWheel  [{}]  {conn}{sync}  ·  {} open{armed}{auto}",
         app.mode_label(),
         app.open_position_count()
     );
     let mut block = Block::bordered().title(title);
-    if app.armed {
-        // A loud, hard-to-miss cue that `x` will transmit a live order.
+    if app.armed || app.zerodte_automating() > 0 {
+        // A loud, hard-to-miss cue that the app may transmit a live order: while
+        // armed (`x`) or whenever a 0DTE slot is auto-trading unattended.
         block = block.border_style(Style::new().fg(Color::Red).add_modifier(Modifier::BOLD));
     }
     let tabs = Tabs::new(titles)

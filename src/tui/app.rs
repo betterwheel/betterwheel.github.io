@@ -19,6 +19,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use tokio::sync::mpsc;
 
 use super::demo;
+use super::schedule;
 use super::live::{
     gather, live_suggestions, position_has_short, price_leg, probe_unknown_tradability,
     resolve_roll_target, right_char, structure_suggestions, sync_wheel_state, LiveData,
@@ -33,6 +34,7 @@ use crate::ibkr::{
 };
 use crate::store::{
     JournalRow, NewJournalEntry, PendingRollRow, Store, WatchlistRow, WheelPositionRow,
+    ZeroDtePositionRow,
 };
 
 
@@ -284,10 +286,29 @@ impl App {
             .into_iter()
             .map(PendingRoll::from_row)
             .collect();
+        // Drop prior-day auto-managed 0DTE positions, keeping today's so a
+        // single-entry slot that already traded today isn't re-entered.
+        let today_et = schedule::eastern_wall(Local::now().naive_utc())
+            .date()
+            .format("%Y-%m-%d")
+            .to_string();
+        let _ = store.prune_zerodte_positions_before(&today_et).await;
+
         // Cheap, broker-free load so the UI draws instantly; the live gather runs
         // off the event loop right after startup (see `tui::run`).
         app.load_local(store).await?;
         Ok(app)
+    }
+
+    /// How many 0DTE slots are armed for unattended auto-trading (the `automate`
+    /// opt-in). Drives the loud header banner.
+    pub fn zerodte_automating(&self) -> usize {
+        self.cfg
+            .zerodte
+            .strategies
+            .iter()
+            .filter(|p| p.automate)
+            .count()
     }
 
     fn list_len(&self) -> usize {
@@ -1225,6 +1246,216 @@ impl App {
         }
     }
 
+    /// One scheduler pass for 0DTE auto-management: for each automated slot that's
+    /// due (its entry time / MEIC interval in US/Eastern), transmit the entry
+    /// combo and record a pending position. Honors the same guardrails as manual
+    /// execution — nothing transmits under `read_only`, while offline, or above
+    /// `max_contracts_per_order`. The per-slot `automate` flag is the standing,
+    /// deliberate opt-in (this app's "friction generator").
+    pub(super) async fn tick_zerodte(&mut self, store: &Store) {
+        if self.cfg.guardrails.read_only {
+            return;
+        }
+        let Some(ibkr) = self.ibkr.clone() else { return };
+        if !self.cfg.zerodte.strategies.iter().any(|p| p.automate) {
+            return; // nothing armed for automation
+        }
+        let now_et = schedule::eastern_wall(Local::now().naive_utc());
+        let today_str = now_et.date().format("%Y-%m-%d").to_string();
+        let positions = store.list_zerodte_positions().await.unwrap_or_default();
+        let mut entered_any = false;
+
+        for i in 0..self.cfg.zerodte.slot_count() {
+            let Some(params) = self.cfg.zerodte.slot(i) else { continue };
+            if !params.automate {
+                continue;
+            }
+            let last_today: Option<chrono::NaiveDateTime> = positions
+                .iter()
+                .filter(|p| p.slot == i as i64 && p.entry_date == today_str)
+                .filter_map(|p| chrono::DateTime::parse_from_rfc3339(&p.created_at).ok())
+                .map(|dt| schedule::eastern_wall(dt.naive_utc()))
+                .max();
+            if !schedule::should_enter(
+                now_et,
+                params.entry_minutes_after_open,
+                params.meic_interval_min,
+                last_today,
+            ) {
+                continue;
+            }
+            let Some(sug) = self.zerodte_suggestions.get(i).and_then(|o| o.as_ref()).cloned() else {
+                tracing::info!("0DTE slot {i} due but no structure to enter this cycle");
+                continue;
+            };
+            if sug.quantity > self.cfg.guardrails.max_contracts_per_order {
+                tracing::warn!("0DTE slot {i}: qty {} over max_contracts_per_order", sug.quantity);
+                continue;
+            }
+            let ActionKind::OpenStructure { kind, legs } = &sug.kind else { continue };
+            let combo = combo_legs_from(legs);
+            let expiry = sug.expiry.format("%Y%m%d").to_string();
+            match self.transmit_structure_combo(&ibkr, &sug, &combo, &expiry).await {
+                Ok(oid) => {
+                    let _ = store
+                        .add_zerodte_position(&ZeroDtePositionRow {
+                            entry_oid: oid.clone(),
+                            slot: i as i64,
+                            strategy: kind.label().to_string(),
+                            underlying: sug.symbol.clone(),
+                            expiry: expiry.clone(),
+                            legs: encode_legs(&combo),
+                            entry_credit: sug.limit_price,
+                            quantity: sug.quantity as i64,
+                            max_loss: sug.capital_required,
+                            profit_target_pct: params.profit_target_pct,
+                            status: "pending".into(),
+                            close_oid: None,
+                            entry_date: today_str.clone(),
+                            created_at: String::new(),
+                        })
+                        .await;
+                    let _ = store
+                        .record(&NewJournalEntry {
+                            status: "submitted".into(),
+                            ibkr_order_id: Some(oid.clone()),
+                            premium: Some(sug.premium_total),
+                            note: Some(format!("AUTO entry: {} {}DTE", kind.label(), sug.dte)),
+                            ..journal_entry_for(&sug, &expiry, right_char(sug.right))
+                        })
+                        .await;
+                    self.status =
+                        format!("⚡ AUTO entered {} {} ×{} → id {oid}", sug.symbol, kind.label(), sug.quantity);
+                    tracing::info!("0DTE auto-entry slot {i}: {} id {oid}", kind.label());
+                    entered_any = true;
+                }
+                Err(e) => {
+                    tracing::warn!("0DTE auto-entry slot {i} failed: {e}");
+                    self.status = format!("⚡ AUTO entry {} failed: {e}", kind.label());
+                }
+            }
+        }
+        // Time-stop is advisory in this cut: the defined-risk wings cap the loss,
+        // so we log (rather than force-close) when an open position passes its
+        // configured close time. An active time-stop (cancel the standing close,
+        // resubmit at market) is a follow-up — it needs an order-cancel path.
+        for p in positions.iter().filter(|p| p.status == "open") {
+            if let Some(ts) = self
+                .cfg
+                .zerodte
+                .slot(p.slot as usize)
+                .and_then(|params| params.time_stop_hhmm.as_deref())
+                && schedule::past_time_stop(now_et, ts)
+            {
+                tracing::warn!(
+                    "0DTE {} past time-stop {ts} — riding to expiry (wings cap the loss)",
+                    p.strategy
+                );
+            }
+        }
+
+        if entered_any {
+            self.journal = store.recent_journal(200).await.unwrap_or_default();
+        }
+    }
+
+    /// Transmit a structure's entry combo (no preview), returning its order id.
+    async fn transmit_structure_combo(
+        &self,
+        ibkr: &Ibkr,
+        sug: &Suggestion,
+        combo: &[ComboLeg],
+        expiry: &str,
+    ) -> Result<String> {
+        let order = ComboOrder {
+            symbol: &sug.symbol,
+            expiry_yyyymmdd: expiry,
+            legs: combo,
+            quantity: sug.quantity,
+            net_credit: sug.limit_price,
+        };
+        match ibkr.submit_or_preview_combo(&order, false).await? {
+            OrderOutcome::Submitted(oid) => Ok(oid),
+            OrderOutcome::Preview(_) => Err(anyhow::anyhow!("execute unexpectedly returned a preview")),
+        }
+    }
+
+    /// React to a fill on a 0DTE auto-managed order: when the *entry* fills, place
+    /// the standing profit-close (reversed combo bought at the target debit — "the
+    /// wings are the stop", so no separate stop order); when the *close* fills,
+    /// mark the position closed. Returns a status line if it acted.
+    async fn handle_zerodte_order_event(
+        &mut self,
+        oid: &str,
+        journal_status: Option<&str>,
+        store: &Store,
+    ) -> Result<Option<String>> {
+        let positions = store.list_zerodte_positions().await?;
+        // Entry leg → place the profit-close on a full fill.
+        if let Some(p) = positions.iter().find(|p| p.entry_oid == oid && p.status == "pending") {
+            match journal_status {
+                Some("filled") => {
+                    let Some(ibkr) = self.ibkr.clone() else { return Ok(None) };
+                    let close_debit = (p.entry_credit * (1.0 - p.profit_target_pct)).max(0.0);
+                    let close_legs = reverse_legs(&decode_legs(&p.legs));
+                    // Buying the reversed package at +debit closes for profit; pass
+                    // the debit as a negative "credit" (the combo limit is negated).
+                    let order = ComboOrder {
+                        symbol: &p.underlying,
+                        expiry_yyyymmdd: &p.expiry,
+                        legs: &close_legs,
+                        quantity: p.quantity as i32,
+                        net_credit: -close_debit,
+                    };
+                    match ibkr.submit_or_preview_combo(&order, false).await {
+                        Ok(OrderOutcome::Submitted(close_oid)) => {
+                            store.update_zerodte_status(&p.entry_oid, "open", Some(&close_oid)).await?;
+                            let _ = store
+                                .record(&NewJournalEntry {
+                                    symbol: p.underlying.clone(),
+                                    action: format!("{} close", p.strategy),
+                                    quantity: p.quantity,
+                                    limit_price: Some(close_debit),
+                                    status: "submitted".into(),
+                                    ibkr_order_id: Some(close_oid.clone()),
+                                    note: Some(format!(
+                                        "AUTO profit-close @ {:.0}% (debit {:.2})",
+                                        p.profit_target_pct * 100.0,
+                                        close_debit
+                                    )),
+                                    ..Default::default()
+                                })
+                                .await;
+                            return Ok(Some(format!("⚡ {} filled → profit-close placed", p.strategy)));
+                        }
+                        Ok(OrderOutcome::Preview(_)) => {
+                            return Ok(Some(format!("{} close: unexpected preview", p.strategy)));
+                        }
+                        Err(e) => {
+                            // Entry is on; mark open without a close so a manual/retry
+                            // close is possible — the wings still cap the loss.
+                            store.update_zerodte_status(&p.entry_oid, "open", None).await?;
+                            return Ok(Some(format!("⚡ {} filled, profit-close failed: {e}", p.strategy)));
+                        }
+                    }
+                }
+                Some(js @ ("cancelled" | "rejected")) => {
+                    store.update_zerodte_status(&p.entry_oid, js, None).await?;
+                    return Ok(Some(format!("⚡ {} entry {js}", p.strategy)));
+                }
+                _ => {}
+            }
+        }
+        // Close leg → mark closed on a full fill.
+        if let Some(p) = positions.iter().find(|p| p.close_oid.as_deref() == Some(oid))
+            && journal_status == Some("filled")
+        {
+            store.update_zerodte_status(&p.entry_oid, "closed", None).await?;
+            return Ok(Some(format!("⚡ {} profit-closed", p.strategy)));
+        }
+        Ok(None)
+    }
+
     /// Apply a live order-activity event from the broker stream: transition the
     /// matching journal row and surface it. A fill changes holdings, so it also
     /// triggers a refresh of positions / wheel state / suggestions.
@@ -1297,10 +1528,20 @@ impl App {
                     }
                 }
 
+                // 0DTE auto-management: an entry fill places the standing
+                // profit-close; a close fill marks the position closed (mirrors the
+                // pending-roll fill handling above).
+                let zerodte_status =
+                    self.handle_zerodte_order_event(&oid, journal_status, store).await?;
+
                 // A plain working ack (no terminal status, nothing filled, not a
-                // roll) needs no UI change — ignore it to avoid status noise.
+                // roll or structure event) needs no UI change — ignore the noise.
                 let traded = journal_status == Some("filled") || filled > 0.0;
-                if journal_status.is_none() && !traded && roll_status.is_none() {
+                if journal_status.is_none()
+                    && !traded
+                    && roll_status.is_none()
+                    && zerodte_status.is_none()
+                {
                     return Ok(());
                 }
 
@@ -1313,7 +1554,7 @@ impl App {
                     self.journal = store.recent_journal(200).await?;
                 }
 
-                self.status = roll_status.unwrap_or_else(|| match journal_status {
+                self.status = roll_status.or(zerodte_status).unwrap_or_else(|| match journal_status {
                     Some(js) => format!("order {oid}: {js}"),
                     None => format!("order {oid}: partial fill {filled:.0}"),
                 });
@@ -1673,6 +1914,47 @@ fn side_and_right(sug: &Suggestion) -> Option<(Side, &'static str)> {
         (ActionKind::SellPutSpread { .. }, _) => None,
         (ActionKind::OpenStructure { .. }, _) => None,
     }
+}
+
+/// Encode combo legs for persistence as `ACTION:strike:RIGHT:ratio` (B/S, P/C)
+/// segments joined by `;` — enough to rebuild the profit-close after a restart
+/// without a serde dependency.
+fn encode_legs(legs: &[ComboLeg]) -> String {
+    legs.iter()
+        .map(|l| {
+            let a = if l.action == Side::Buy { "B" } else { "S" };
+            format!("{a}:{}:{}:{}", l.strike, l.right, l.ratio)
+        })
+        .collect::<Vec<_>>()
+        .join(";")
+}
+
+/// Inverse of [`encode_legs`].
+fn decode_legs(s: &str) -> Vec<ComboLeg> {
+    s.split(';')
+        .filter_map(|seg| {
+            let mut it = seg.split(':');
+            let action = if it.next()? == "B" { Side::Buy } else { Side::Sell };
+            let strike: f64 = it.next()?.parse().ok()?;
+            let right = if it.next()? == "C" { "C" } else { "P" };
+            let ratio: i32 = it.next()?.parse().ok()?;
+            Some(ComboLeg { strike, right, action, ratio })
+        })
+        .collect()
+}
+
+/// The profit-close legs: the entry combo with every leg's side flipped. Buying
+/// this reversed package (at the target debit) closes the position.
+fn reverse_legs(legs: &[ComboLeg]) -> Vec<ComboLeg> {
+    legs.iter()
+        .map(|l| ComboLeg {
+            action: match l.action {
+                Side::Buy => Side::Sell,
+                Side::Sell => Side::Buy,
+            },
+            ..*l
+        })
+        .collect()
 }
 
 /// Collapse a structure's legs into IBKR combo legs, merging identical

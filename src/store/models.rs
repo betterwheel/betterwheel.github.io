@@ -78,6 +78,28 @@ pub struct PendingRollRow {
     pub created_at: String,
 }
 
+/// An auto-managed 0DTE structure position (see the `zerodte_positions` table).
+/// Lives from entry submission (`pending`) through fill (`open`, profit-close
+/// placed) to `closed`. `legs` is the entry combo encoded as
+/// `ACTION:strike:RIGHT:ratio` segments joined by `;`.
+#[derive(Debug, Clone, FromRow)]
+pub struct ZeroDtePositionRow {
+    pub entry_oid: String,
+    pub slot: i64,
+    pub strategy: String,
+    pub underlying: String,
+    pub expiry: String,
+    pub legs: String,
+    pub entry_credit: f64,
+    pub quantity: i64,
+    pub max_loss: f64,
+    pub profit_target_pct: f64,
+    pub status: String,
+    pub close_oid: Option<String>,
+    pub entry_date: String,
+    pub created_at: String,
+}
+
 /// Fields for a new journal entry (id/ts are assigned on insert).
 #[derive(Debug, Clone, Default)]
 pub struct NewJournalEntry {
