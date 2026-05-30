@@ -5,6 +5,7 @@ pub mod covered_call;
 pub mod csp;
 pub mod manage;
 pub mod math;
+pub mod structures;
 pub mod types;
 
 pub use types::*;
@@ -138,7 +139,10 @@ fn kind_priority(k: &ActionKind) -> u8 {
     match k {
         ActionKind::CloseForProfit => 0,
         ActionKind::Roll { .. } => 1,
-        ActionKind::SellPut | ActionKind::SellCall | ActionKind::SellPutSpread { .. } => 2,
+        ActionKind::SellPut
+        | ActionKind::SellCall
+        | ActionKind::SellPutSpread { .. }
+        | ActionKind::OpenStructure { .. } => 2,
     }
 }
 

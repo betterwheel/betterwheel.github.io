@@ -21,13 +21,15 @@ use tokio::sync::mpsc;
 use super::demo;
 use super::live::{
     gather, live_suggestions, position_has_short, price_leg, probe_unknown_tradability,
-    resolve_roll_target, right_char, sync_wheel_state, LiveData,
+    resolve_roll_target, right_char, structure_suggestions, sync_wheel_state, LiveData,
 };
 use crate::config::{Config, TradingMode, UserSettings};
-use crate::engine::types::{ActionKind, Right, Suggestion, WheelState};
+use crate::engine::types::{
+    ActionKind, LegSide, Right, StructureKind, StructureLeg, Suggestion, WheelState,
+};
 use crate::ibkr::{
-    AccountSnapshot, Ibkr, OpenOrderInfo, OptionOrder, OrderEvent, OrderOutcome, PositionRow, Side,
-    SpreadOrder,
+    AccountSnapshot, ComboLeg, ComboOrder, Ibkr, OpenOrderInfo, OptionOrder, OrderEvent,
+    OrderOutcome, PositionRow, Side, SpreadOrder,
 };
 use crate::store::{
     JournalRow, NewJournalEntry, PendingRollRow, Store, WatchlistRow, WheelPositionRow,
@@ -41,17 +43,19 @@ pub enum Tab {
     Watchlist,
     Suggestions,
     HedgedWheel,
+    ZeroDte,
     Journal,
     Settings,
     Help,
 }
 
 impl Tab {
-    pub const ALL: [Tab; 7] = [
+    pub const ALL: [Tab; 8] = [
         Tab::Dashboard,
         Tab::Watchlist,
         Tab::Suggestions,
         Tab::HedgedWheel,
+        Tab::ZeroDte,
         Tab::Journal,
         Tab::Settings,
         Tab::Help,
@@ -63,6 +67,7 @@ impl Tab {
             Tab::Watchlist => "Watchlist",
             Tab::Suggestions => "Suggestions",
             Tab::HedgedWheel => "Hedged Wheel",
+            Tab::ZeroDte => "0DTE",
             Tab::Journal => "Journal",
             Tab::Settings => "Settings",
             Tab::Help => "Help",
@@ -130,6 +135,10 @@ pub struct App {
     pub suggestions: Vec<Suggestion>,
     /// Hedged Wheel suggestions (defined-risk put spreads) — the Hedged Wheel tab.
     pub hedged_suggestions: Vec<Suggestion>,
+    /// 0DTE-tab structure suggestions, one per configured quadrant slot (`None`
+    /// where nothing currently fits). Indexed by slot, parallel to
+    /// `cfg.zerodte.slots`; the 0DTE tab's selection (`self.selected`) is a slot.
+    pub zerodte_suggestions: Vec<Option<Suggestion>>,
     pub journal: Vec<JournalRow>,
     /// Per-symbol wheel state from the local store.
     pub positions: Vec<WheelPositionRow>,
@@ -245,6 +254,7 @@ impl App {
             watchlist: Vec::new(),
             suggestions: Vec::new(),
             hedged_suggestions: Vec::new(),
+            zerodte_suggestions: Vec::new(),
             journal: Vec::new(),
             positions: Vec::new(),
             broker_positions: Vec::new(),
@@ -285,6 +295,7 @@ impl App {
             Tab::Watchlist => self.watchlist.len(),
             Tab::Suggestions => self.suggestions.len(),
             Tab::HedgedWheel => self.hedged_suggestions.len(),
+            Tab::ZeroDte => self.zerodte_suggestions.len(), // one entry per quadrant slot
             Tab::Journal => self.journal.len(),
             Tab::Settings => 2, // win-rate row + take-profit row
             _ => 0,
@@ -297,6 +308,9 @@ impl App {
         match self.tab {
             Tab::Suggestions => self.suggestions.get(self.selected),
             Tab::HedgedWheel => self.hedged_suggestions.get(self.selected),
+            // On the 0DTE tab the selection is a quadrant slot; some slots may
+            // hold no current structure (`None`).
+            Tab::ZeroDte => self.zerodte_suggestions.get(self.selected).and_then(|o| o.as_ref()),
             _ => None,
         }
     }
@@ -354,7 +368,7 @@ impl App {
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => Some(Action::Quit),
             KeyCode::Tab | KeyCode::Right => Some(Action::NextTab),
             KeyCode::BackTab | KeyCode::Left => Some(Action::PrevTab),
-            KeyCode::Char(d @ '1'..='7') => Some(Action::JumpTab(d as usize - '1' as usize)),
+            KeyCode::Char(d @ '1'..='8') => Some(Action::JumpTab(d as usize - '1' as usize)),
             KeyCode::Char('j') | KeyCode::Down => Some(Action::Down),
             KeyCode::Char('k') | KeyCode::Up => Some(Action::Up),
             KeyCode::Char('a') => Some(Action::StartAddSymbol),
@@ -364,7 +378,7 @@ impl App {
             KeyCode::Char('A') => Some(Action::ToggleArm),
             KeyCode::Char('p') => Some(Action::Preview),
             KeyCode::Char('x') => Some(Action::Execute),
-            KeyCode::Enter if matches!(self.tab, Tab::Suggestions | Tab::HedgedWheel) => {
+            KeyCode::Enter if matches!(self.tab, Tab::Suggestions | Tab::HedgedWheel | Tab::ZeroDte) => {
                 Some(Action::OpenDetail)
             }
             _ => None,
@@ -513,6 +527,11 @@ impl App {
         if let ActionKind::SellPutSpread { long_strike, .. } = sug.kind {
             return self.preview_or_execute_spread(&ibkr, sug, long_strike, true, store).await;
         }
+        if let ActionKind::OpenStructure { kind, legs } = &sug.kind {
+            return self
+                .preview_or_execute_structure(&ibkr, sug, *kind, &legs.clone(), true, store)
+                .await;
+        }
         let Some((side, right_str)) = side_and_right(sug) else {
             self.status = "this action can't be previewed".into();
             return Ok(());
@@ -603,6 +622,11 @@ impl App {
         }
         if let ActionKind::SellPutSpread { long_strike, .. } = sug.kind {
             return self.preview_or_execute_spread(&ibkr, sug, long_strike, false, store).await;
+        }
+        if let ActionKind::OpenStructure { kind, legs } = &sug.kind {
+            return self
+                .preview_or_execute_structure(&ibkr, sug, *kind, &legs.clone(), false, store)
+                .await;
         }
         let Some((side, right_str)) = side_and_right(sug) else {
             self.status = "this action can't be executed".into();
@@ -725,6 +749,108 @@ impl App {
             Err(e) => {
                 self.status =
                     format!("{} spread error: {e}", if preview { "preview" } else { "execute" });
+                store
+                    .record(&NewJournalEntry {
+                        status: "rejected".into(),
+                        note: Some(e.to_string()),
+                        ..entry_base
+                    })
+                    .await?;
+            }
+        }
+        self.journal = store.recent_journal(200).await?;
+        Ok(())
+    }
+
+    /// Preview (what-if) or transmit a 0DTE **structure** (iron condor, credit
+    /// spread, broken-wing fly, iron fly, strangle) as one atomic N-leg combo,
+    /// journaled as a single entry. Shared by the preview/execute paths so they
+    /// can't drift; the execute caller has already enforced the arm / read_only /
+    /// max-contracts guardrails (preview needs none).
+    async fn preview_or_execute_structure(
+        &mut self,
+        ibkr: &Ibkr,
+        sug: &Suggestion,
+        kind: StructureKind,
+        legs: &[StructureLeg],
+        preview: bool,
+        store: &Store,
+    ) -> Result<()> {
+        let expiry = sug.expiry.format("%Y%m%d").to_string();
+        let combo_legs = combo_legs_from(legs);
+        let order = ComboOrder {
+            symbol: &sug.symbol,
+            expiry_yyyymmdd: &expiry,
+            legs: &combo_legs,
+            quantity: sug.quantity,
+            net_credit: sug.limit_price,
+        };
+        // One journal row for the whole combo, noting the structure + leg count.
+        let note = format!(
+            "{} {}DTE: {}-leg combo, net credit {:.2}, max loss ${:.0}",
+            kind.label(),
+            sug.dte,
+            combo_legs.len(),
+            sug.limit_price,
+            sug.capital_required,
+        );
+        let entry_base = NewJournalEntry {
+            note: Some(note),
+            ..journal_entry_for(sug, &expiry, right_char(sug.right))
+        };
+        match ibkr.submit_or_preview_combo(&order, preview).await {
+            Ok(OrderOutcome::Preview(state)) => {
+                let margin = state
+                    .initial_margin_after
+                    .map(|v| format!("${v:.0}"))
+                    .unwrap_or_else(|| "?".into());
+                let commission = state
+                    .commission
+                    .map(|v| format!("${v:.2}"))
+                    .unwrap_or_else(|| "?".into());
+                self.status = format!(
+                    "preview {} {} ×{}: margin {} (≈max loss ${:.0}) · commission {} · {}",
+                    sug.symbol,
+                    kind.label(),
+                    sug.quantity,
+                    margin,
+                    sug.capital_required,
+                    commission,
+                    state.status
+                );
+                store
+                    .record(&NewJournalEntry {
+                        status: "previewed".into(),
+                        premium: Some(sug.premium_total),
+                        ..entry_base
+                    })
+                    .await?;
+            }
+            Ok(OrderOutcome::Submitted(oid)) => {
+                self.status = format!(
+                    "submitted {} {} ×{} @{:.2}cr → id {oid}",
+                    sug.symbol,
+                    kind.label(),
+                    sug.quantity,
+                    sug.limit_price
+                );
+                store
+                    .record(&NewJournalEntry {
+                        status: "submitted".into(),
+                        ibkr_order_id: Some(oid),
+                        premium: Some(sug.premium_total),
+                        ..entry_base
+                    })
+                    .await?;
+                // Safety: a successful transmit auto-disarms.
+                self.armed = false;
+            }
+            Err(e) => {
+                self.status = format!(
+                    "{} {} error: {e}",
+                    if preview { "preview" } else { "execute" },
+                    kind.label()
+                );
                 store
                     .record(&NewJournalEntry {
                         status: "rejected".into(),
@@ -1237,6 +1363,8 @@ impl App {
                 .map(|r| r.symbol.clone())
                 .collect();
             self.suggestions = demo::demo_suggestions(&symbols, &self.cfg.engine, today);
+            self.zerodte_suggestions =
+                demo::demo_zerodte(&self.cfg.zerodte, &self.cfg.engine, today);
         }
         self.positions = store.list_positions().await?;
         if self.selected >= self.list_len() {
@@ -1304,6 +1432,13 @@ impl App {
                     .await;
                     self.suggestions = classic;
                     self.hedged_suggestions = hedged;
+                    self.zerodte_suggestions = structure_suggestions(
+                        &ibkr,
+                        &self.cfg.zerodte,
+                        self.cfg.engine.risk_free_rate,
+                        today,
+                    )
+                    .await;
                 }
                 Err(e) => {
                     // Positions are unknown: preserve the stored wheel state for
@@ -1312,6 +1447,7 @@ impl App {
                     // longer see.
                     tracing::warn!("positions fetch failed; clearing suggestions, keeping stored state: {e}");
                     self.suggestions.clear();
+                    self.zerodte_suggestions.clear();
                     self.status =
                         "broker positions unavailable — suggestions cleared until refresh".into();
                 }
@@ -1324,6 +1460,8 @@ impl App {
                 .map(|r| r.symbol.clone())
                 .collect();
             self.suggestions = demo::demo_suggestions(&symbols, &self.cfg.engine, today);
+            self.zerodte_suggestions =
+                demo::demo_zerodte(&self.cfg.zerodte, &self.cfg.engine, today);
         }
 
         // Load the (possibly just-synced) wheel positions last so the dashboard
@@ -1430,6 +1568,7 @@ impl App {
             self.broker_positions = d.broker_positions;
             self.suggestions = d.suggestions;
             self.hedged_suggestions = d.hedged_suggestions;
+            self.zerodte_suggestions = d.zerodte_suggestions;
             // Reconcile prior-session rolls on the loop — a no-op unless some are
             // still reconstructed. This is the stateful/transmitting path, so it
             // must never run on the background task.
@@ -1445,6 +1584,7 @@ impl App {
         } else {
             self.suggestions.clear();
             self.hedged_suggestions.clear();
+            self.zerodte_suggestions.clear();
             self.status = "broker positions unavailable — suggestions cleared until refresh".into();
         }
         self.positions = d.positions;
@@ -1517,6 +1657,7 @@ fn format_kind(k: &ActionKind) -> String {
         ActionKind::CloseForProfit => "Close".into(),
         ActionKind::Roll { .. } => "Roll".into(),
         ActionKind::SellPutSpread { .. } => "SellPutSpread".into(),
+        ActionKind::OpenStructure { kind, .. } => kind.label().into(),
     }
 }
 
@@ -1527,9 +1668,37 @@ fn side_and_right(sug: &Suggestion) -> Option<(Side, &'static str)> {
         (ActionKind::CloseForProfit, Right::Put) => Some((Side::Buy, "P")),
         (ActionKind::CloseForProfit, Right::Call) => Some((Side::Buy, "C")),
         (ActionKind::Roll { .. }, _) => None,
-        // A spread isn't a single-leg order; preview/execute handle it explicitly.
+        // Neither a spread nor a multi-leg structure is a single-leg order;
+        // preview/execute handle those as combos explicitly.
         (ActionKind::SellPutSpread { .. }, _) => None,
+        (ActionKind::OpenStructure { .. }, _) => None,
     }
+}
+
+/// Collapse a structure's legs into IBKR combo legs, merging identical
+/// (strike, right, side) legs into one with the summed ratio — so a butterfly's
+/// doubled body becomes a single ratio-2 leg rather than two duplicate BAG legs.
+fn combo_legs_from(legs: &[StructureLeg]) -> Vec<ComboLeg> {
+    let mut out: Vec<ComboLeg> = Vec::new();
+    for l in legs {
+        let right = match l.right {
+            Right::Put => "P",
+            Right::Call => "C",
+        };
+        let action = match l.side {
+            LegSide::Buy => Side::Buy,
+            LegSide::Sell => Side::Sell,
+        };
+        if let Some(c) = out
+            .iter_mut()
+            .find(|c| (c.strike - l.strike).abs() < 1e-6 && c.right == right && c.action == action)
+        {
+            c.ratio += 1;
+        } else {
+            out.push(ComboLeg { strike: l.strike, right, action, ratio: 1 });
+        }
+    }
+    out
 }
 
 fn journal_entry_for(sug: &Suggestion, expiry: &str, right_str: &str) -> NewJournalEntry {
@@ -1606,6 +1775,31 @@ mod tests {
         // Offline → the real engine runs over demo chains, so the enabled symbol
         // yields at least one suggestion.
         assert!(!app.suggestions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn zerodte_tab_renders_structures_offline() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let store = Store::open_in_memory().await.unwrap();
+        let mut app = offline_app(&store).await;
+        app.tab = Tab::ZeroDte;
+        // Offline boot populated the 2×2 grid from demo SPX chains (all four slots).
+        assert_eq!(app.zerodte_suggestions.len(), 4);
+        assert!(app.zerodte_suggestions.iter().all(|s| s.is_some()));
+
+        let backend = TestBackend::new(140, 44);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| crate::tui::ui::render(f, &app)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        // The grid draws the flagship condor and the prominent risk metric.
+        assert!(text.contains("Iron Condor"), "0DTE tab missing Iron Condor title");
+        assert!(text.contains("max loss"), "0DTE tab missing risk metrics");
     }
 
     // --- shared test helpers ---
