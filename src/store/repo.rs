@@ -131,6 +131,26 @@ impl Store {
         Ok(())
     }
 
+    /// The persisted 0DTE roster-overrides blob (in-app slot edits), if any.
+    pub async fn get_zerodte_blob(&self) -> Result<Option<String>> {
+        let row: Option<(String,)> = sqlx::query_as("SELECT json FROM zerodte_settings WHERE id = 1")
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(|(j,)| j))
+    }
+
+    /// Persist the 0DTE roster-overrides blob (single row, id = 1; upsert).
+    pub async fn put_zerodte_blob(&self, blob: &str) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO zerodte_settings (id, json) VALUES (1, ?1)
+             ON CONFLICT(id) DO UPDATE SET json = excluded.json",
+        )
+        .bind(blob)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     // --- wheel positions ---
 
     pub async fn upsert_position(&self, p: &WheelPositionRow) -> Result<()> {
