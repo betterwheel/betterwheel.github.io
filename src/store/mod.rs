@@ -7,5 +7,7 @@
 pub mod models;
 pub mod repo;
 
-pub use models::{JournalRow, NewJournalEntry, PendingRollRow, WatchlistRow, WheelPositionRow};
+pub use models::{
+    JournalRow, NewJournalEntry, PendingRollRow, WatchlistRow, WheelPositionRow, ZeroDtePositionRow,
+};
 pub use repo::Store;

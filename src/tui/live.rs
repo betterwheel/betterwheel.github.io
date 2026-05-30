@@ -1016,11 +1016,38 @@ mod tests {
         };
         match ibkr.submit_or_preview_combo(&order, true).await {
             Ok(OrderOutcome::Preview(state)) => eprintln!(
-                "PREVIEW OK — status={} init_margin={:?} commission={:?} (struct max loss ${:.0})",
+                "ENTRY PREVIEW OK — status={} init_margin={:?} commission={:?} (struct max loss ${:.0})",
                 state.status, state.initial_margin_after, state.commission, sug.capital_required
             ),
             Ok(OrderOutcome::Submitted(_)) => panic!("preview unexpectedly transmitted!"),
             Err(e) => panic!("combo preview failed: {e}"),
+        }
+
+        // Also verify the profit-close: reverse every leg and buy the package back
+        // at the 40%-profit debit (the exact construction the scheduler uses on an
+        // entry fill). Read-only — confirms IBKR accepts the reversed BAG + sign.
+        let close_legs: Vec<ComboLeg> = combo
+            .iter()
+            .map(|l| ComboLeg {
+                action: if l.action == Side::Buy { Side::Sell } else { Side::Buy },
+                ..*l
+            })
+            .collect();
+        let close_debit = sug.limit_price * 0.60;
+        let close = ComboOrder {
+            symbol: &sug.symbol,
+            expiry_yyyymmdd: &expiry,
+            legs: &close_legs,
+            quantity: sug.quantity,
+            net_credit: -close_debit, // a debit close: negated into a +debit limit
+        };
+        match ibkr.submit_or_preview_combo(&close, true).await {
+            Ok(OrderOutcome::Preview(state)) => eprintln!(
+                "CLOSE PREVIEW OK — status={} (buy-to-close debit {:.2}, keeps {:.2} of {:.2})",
+                state.status, close_debit, sug.limit_price - close_debit, sug.limit_price
+            ),
+            Ok(OrderOutcome::Submitted(_)) => panic!("close preview unexpectedly transmitted!"),
+            Err(e) => panic!("close combo preview failed: {e}"),
         }
     }
 }

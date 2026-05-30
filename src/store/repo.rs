@@ -7,7 +7,9 @@ use anyhow::{Context, Result};
 use sqlx::SqlitePool;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 
-use super::models::{JournalRow, NewJournalEntry, PendingRollRow, WatchlistRow, WheelPositionRow};
+use super::models::{
+    JournalRow, NewJournalEntry, PendingRollRow, WatchlistRow, WheelPositionRow, ZeroDtePositionRow,
+};
 
 /// Handle to the local database. Cheap to clone (shares the pool).
 #[derive(Clone)]
@@ -302,6 +304,79 @@ impl Store {
         Ok(())
     }
 
+    // --- 0DTE auto-managed positions ---
+
+    /// Persist a freshly-opened 0DTE position (status `pending` until its entry
+    /// combo fills). Keyed by the entry order id; a duplicate is ignored.
+    pub async fn add_zerodte_position(&self, r: &ZeroDtePositionRow) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO zerodte_positions
+               (entry_oid, slot, strategy, underlying, expiry, legs, entry_credit, quantity,
+                max_loss, profit_target_pct, status, close_oid, entry_date, created_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)
+             ON CONFLICT(entry_oid) DO NOTHING",
+        )
+        .bind(&r.entry_oid)
+        .bind(r.slot)
+        .bind(&r.strategy)
+        .bind(&r.underlying)
+        .bind(&r.expiry)
+        .bind(&r.legs)
+        .bind(r.entry_credit)
+        .bind(r.quantity)
+        .bind(r.max_loss)
+        .bind(r.profit_target_pct)
+        .bind(&r.status)
+        .bind(&r.close_oid)
+        .bind(&r.entry_date)
+        .bind(now())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn list_zerodte_positions(&self) -> Result<Vec<ZeroDtePositionRow>> {
+        let rows = sqlx::query_as::<_, ZeroDtePositionRow>(
+            "SELECT entry_oid, slot, strategy, underlying, expiry, legs, entry_credit, quantity,
+                    max_loss, profit_target_pct, status, close_oid, entry_date, created_at
+             FROM zerodte_positions",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// Update a position's lifecycle status; sets `close_oid` only when a non-null
+    /// one is supplied (so a plain status change keeps the existing close id).
+    pub async fn update_zerodte_status(
+        &self,
+        entry_oid: &str,
+        status: &str,
+        close_oid: Option<&str>,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE zerodte_positions
+                SET status = ?2, close_oid = COALESCE(?3, close_oid)
+              WHERE entry_oid = ?1",
+        )
+        .bind(entry_oid)
+        .bind(status)
+        .bind(close_oid)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Drop positions whose ET trading date is before `date` (a startup cleanup,
+    /// bounding the table while keeping today's rows for the "entered today" check).
+    pub async fn prune_zerodte_positions_before(&self, date: &str) -> Result<()> {
+        sqlx::query("DELETE FROM zerodte_positions WHERE entry_date < ?1")
+            .bind(date)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     pub async fn recent_journal(&self, limit: i64) -> Result<Vec<JournalRow>> {
         let rows = sqlx::query_as::<_, JournalRow>(
             "SELECT id, ts, symbol, action, right, strike, expiry, quantity, limit_price,
@@ -524,5 +599,48 @@ mod tests {
 
         s.remove_pending_roll("55").await.unwrap();
         assert!(s.list_pending_rolls().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn zerodte_position_lifecycle() {
+        let s = Store::open_in_memory().await.unwrap();
+        s.add_zerodte_position(&ZeroDtePositionRow {
+            entry_oid: "900".into(),
+            slot: 0,
+            strategy: "Iron Condor".into(),
+            underlying: "SPX".into(),
+            expiry: "20260601".into(),
+            legs: "B:7480:P:1;S:7510:P:1;S:7635:C:1;B:7660:C:1".into(),
+            entry_credit: 4.65,
+            quantity: 1,
+            max_loss: 2535.0,
+            profit_target_pct: 0.40,
+            status: "pending".into(),
+            close_oid: None,
+            entry_date: "2026-06-01".into(),
+            created_at: String::new(),
+        })
+        .await
+        .unwrap();
+
+        // Entry fills → open, with a close order id recorded.
+        s.update_zerodte_status("900", "open", Some("901")).await.unwrap();
+        let rows = s.list_zerodte_positions().await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status, "open");
+        assert_eq!(rows[0].close_oid.as_deref(), Some("901"));
+        assert!(!rows[0].created_at.is_empty());
+
+        // A plain status change keeps the existing close id (COALESCE).
+        s.update_zerodte_status("900", "closed", None).await.unwrap();
+        let rows = s.list_zerodte_positions().await.unwrap();
+        assert_eq!(rows[0].status, "closed");
+        assert_eq!(rows[0].close_oid.as_deref(), Some("901"));
+
+        // Pruning drops earlier days, keeps today.
+        s.prune_zerodte_positions_before("2026-06-01").await.unwrap();
+        assert_eq!(s.list_zerodte_positions().await.unwrap().len(), 1);
+        s.prune_zerodte_positions_before("2026-06-02").await.unwrap();
+        assert!(s.list_zerodte_positions().await.unwrap().is_empty());
     }
 }
