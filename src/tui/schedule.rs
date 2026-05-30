@@ -82,6 +82,14 @@ pub fn past_time_stop(now_et: NaiveDateTime, hhmm: &str) -> bool {
     }
 }
 
+/// Whether an open structure's stop-loss has triggered: its current cost to close
+/// implies a loss of at least `stop_loss_mult ×` the credit received. `0` (or
+/// negative) disables the stop ("the wings are the stop"). Loss = cost-to-close −
+/// credit, so a 1.2 multiple closes once the loss reaches 120% of the credit.
+pub fn stop_triggered(cost_to_close: f64, entry_credit: f64, stop_loss_mult: f64) -> bool {
+    stop_loss_mult > 0.0 && (cost_to_close - entry_credit) >= stop_loss_mult * entry_credit
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -137,5 +145,17 @@ mod tests {
         assert!(past_time_stop(et, "15:30"));
         assert!(!past_time_stop(et, "15:45"));
         assert!(!past_time_stop(et, "garbage"));
+    }
+
+    #[test]
+    fn stop_loss_fires_past_the_multiple_only() {
+        // Took $2.00 credit; 1.2× stop ⇒ fire once the loss reaches $2.40, i.e.
+        // cost-to-close ≥ $4.40.
+        assert!(!stop_triggered(3.0, 2.0, 1.2)); // loss $1.00 — under
+        assert!(stop_triggered(4.5, 2.0, 1.2)); // loss $2.50 — over
+        assert!(stop_triggered(4.4, 2.0, 1.2)); // exactly at the threshold
+        // A profit (cost below credit) never triggers; 0 disables the stop.
+        assert!(!stop_triggered(1.0, 2.0, 1.2));
+        assert!(!stop_triggered(99.0, 2.0, 0.0));
     }
 }

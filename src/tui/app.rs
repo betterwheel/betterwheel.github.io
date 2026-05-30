@@ -1430,26 +1430,41 @@ impl App {
                 }
             }
         }
-        // Time-stop is advisory in this cut: the defined-risk wings cap the loss,
-        // so we log (rather than force-close) when an open position passes its
-        // configured close time. An active time-stop (cancel the standing close,
-        // resubmit at market) is a follow-up — it needs an order-cancel path.
-        for p in positions.iter().filter(|p| p.status == "open") {
-            if let Some(ts) = self
-                .cfg
-                .zerodte
-                .slot(p.slot as usize)
-                .and_then(|params| params.time_stop_hhmm.as_deref())
-                && schedule::past_time_stop(now_et, ts)
-            {
-                tracing::warn!(
-                    "0DTE {} past time-stop {ts} — riding to expiry (wings cap the loss)",
-                    p.strategy
-                );
+        // Active stop-loss / time-stop on open positions: price the structure and,
+        // if its loss has breached the stop or it's past the time-stop, cancel the
+        // standing profit-close and submit a marketable close. Only slots that
+        // configure a stop or time-stop are priced (so market-data load is bounded;
+        // for the defined-risk default both are off and the wings are the stop).
+        let mut closed_any = false;
+        for p in &positions {
+            if p.status != "open" {
+                continue;
+            }
+            let (stop_mult, time_stop) = match self.cfg.zerodte.slot(p.slot as usize) {
+                Some(params) => (params.stop_loss_mult, params.time_stop_hhmm.clone()),
+                None => continue,
+            };
+            let timed_out =
+                time_stop.as_deref().is_some_and(|ts| schedule::past_time_stop(now_et, ts));
+            if stop_mult <= 0.0 && !timed_out {
+                continue;
+            }
+            let legs = decode_legs(&p.legs);
+            let cost = match ibkr.price_combo(&p.underlying, &p.expiry, &legs).await {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!("0DTE {}: stop check unpriced ({e})", p.strategy);
+                    continue;
+                }
+            };
+            if schedule::stop_triggered(cost, p.entry_credit, stop_mult) {
+                closed_any |= self.close_structure_now(&ibkr, p, cost, "stop-loss", store).await;
+            } else if timed_out {
+                closed_any |= self.close_structure_now(&ibkr, p, cost, "time-stop", store).await;
             }
         }
 
-        if entered_any {
+        if entered_any || closed_any {
             self.journal = store.recent_journal(200).await.unwrap_or_default();
         }
     }
@@ -1475,6 +1490,152 @@ impl App {
         }
     }
 
+    /// Actively close an open structure now (stop-loss or time-stop): cancel the
+    /// standing profit-close, then submit a marketable buy-to-close at the current
+    /// cost plus a small buffer so it fills. Moves the position to `closing` keyed
+    /// on the new order id; returns whether a close was submitted.
+    async fn close_structure_now(
+        &mut self,
+        ibkr: &Ibkr,
+        p: &ZeroDtePositionRow,
+        cost_to_close: f64,
+        reason: &str,
+        store: &Store,
+    ) -> bool {
+        // Pull the standing profit-close first so we don't double-close.
+        if let Some(old) = &p.close_oid
+            && let Err(e) = ibkr.cancel_order(old).await
+        {
+            tracing::warn!("0DTE {}: cancel standing close {old}: {e}", p.strategy);
+        }
+        let close_legs = reverse_legs(&decode_legs(&p.legs));
+        let limit_debit = (cost_to_close + 0.20).max(0.0); // marketable buffer; tick-rounded in ibkr
+        let order = ComboOrder {
+            symbol: &p.underlying,
+            expiry_yyyymmdd: &p.expiry,
+            legs: &close_legs,
+            quantity: p.quantity as i32,
+            net_credit: -limit_debit,
+        };
+        match ibkr.submit_or_preview_combo(&order, false).await {
+            Ok(OrderOutcome::Submitted(oid)) => {
+                let _ = store.update_zerodte_status(&p.entry_oid, "closing", Some(&oid)).await;
+                let _ = store
+                    .record(&NewJournalEntry {
+                        symbol: p.underlying.clone(),
+                        action: format!("{} {reason}", p.strategy),
+                        quantity: p.quantity,
+                        limit_price: Some(limit_debit),
+                        status: "submitted".into(),
+                        ibkr_order_id: Some(oid.clone()),
+                        note: Some(format!("AUTO {reason} close @ ~{limit_debit:.2} debit")),
+                        ..Default::default()
+                    })
+                    .await;
+                self.status = format!("⚡ {} {reason} → closing (id {oid})", p.strategy);
+                tracing::info!("0DTE {} {reason} close id {oid}", p.strategy);
+                true
+            }
+            Ok(OrderOutcome::Preview(_)) => false,
+            Err(e) => {
+                tracing::warn!("0DTE {} {reason} close failed: {e}", p.strategy);
+                self.status = format!("⚡ {} {reason} close failed: {e}", p.strategy);
+                false
+            }
+        }
+    }
+
+    /// Place the standing profit-close for an open structure: the entry combo with
+    /// every leg flipped, bought at the target debit (keeps `1 − profit_target` of
+    /// the credit). Marks the position `open` with the new close order id; on
+    /// failure leaves it `open` with no close (the wings still cap the loss).
+    /// Shared by the fill handler and the restart reconciler.
+    async fn place_profit_close(
+        &self,
+        ibkr: &Ibkr,
+        p: &ZeroDtePositionRow,
+        store: &Store,
+    ) -> std::result::Result<String, String> {
+        let close_debit = (p.entry_credit * (1.0 - p.profit_target_pct)).max(0.0);
+        let close_legs = reverse_legs(&decode_legs(&p.legs));
+        let order = ComboOrder {
+            symbol: &p.underlying,
+            expiry_yyyymmdd: &p.expiry,
+            legs: &close_legs,
+            quantity: p.quantity as i32,
+            net_credit: -close_debit, // a debit close: negated into a +debit limit
+        };
+        match ibkr.submit_or_preview_combo(&order, false).await {
+            Ok(OrderOutcome::Submitted(close_oid)) => {
+                let _ = store.update_zerodte_status(&p.entry_oid, "open", Some(&close_oid)).await;
+                let _ = store
+                    .record(&NewJournalEntry {
+                        symbol: p.underlying.clone(),
+                        action: format!("{} close", p.strategy),
+                        quantity: p.quantity,
+                        limit_price: Some(close_debit),
+                        status: "submitted".into(),
+                        ibkr_order_id: Some(close_oid.clone()),
+                        note: Some(format!(
+                            "AUTO profit-close @ {:.0}% (debit {:.2})",
+                            p.profit_target_pct * 100.0,
+                            close_debit
+                        )),
+                        ..Default::default()
+                    })
+                    .await;
+                Ok(close_oid)
+            }
+            Ok(OrderOutcome::Preview(_)) => Err("unexpected preview".into()),
+            Err(e) => {
+                let _ = store.update_zerodte_status(&p.entry_oid, "open", None).await;
+                Err(e.to_string())
+            }
+        }
+    }
+
+    /// Reconcile persisted 0DTE positions against the broker on (re)connect: an
+    /// entry that filled while the app was down gets its profit-close placed; a
+    /// position whose shorts are gone is marked closed; a still-held position whose
+    /// close order vanished gets it re-placed. Mirrors the pending-roll reconcile.
+    pub(super) async fn reconcile_zerodte_positions(
+        &mut self,
+        open_orders: &[OpenOrderInfo],
+        broker_positions: &[PositionRow],
+        store: &Store,
+    ) {
+        let Some(ibkr) = self.ibkr.clone() else { return };
+        let positions = store.list_zerodte_positions().await.unwrap_or_default();
+        for p in &positions {
+            if matches!(p.status.as_str(), "closed" | "cancelled") {
+                continue;
+            }
+            let held = structure_held(broker_positions, p);
+            let entry_open = open_orders.iter().any(|o| o.order_id == p.entry_oid);
+            let close_open = p
+                .close_oid
+                .as_deref()
+                .is_some_and(|c| open_orders.iter().any(|o| o.order_id == c));
+            match reconcile_action(&p.status, held, entry_open, close_open) {
+                ZerodteReconcile::Leave => {}
+                ZerodteReconcile::Closed => {
+                    let _ = store.update_zerodte_status(&p.entry_oid, "closed", None).await;
+                    tracing::info!("0DTE {}: reconciled to closed (shorts gone)", p.strategy);
+                }
+                ZerodteReconcile::Cancelled => {
+                    let _ = store.update_zerodte_status(&p.entry_oid, "cancelled", None).await;
+                    tracing::info!("0DTE {}: reconciled to cancelled (entry never filled)", p.strategy);
+                }
+                ZerodteReconcile::PlaceClose => {
+                    tracing::info!("0DTE {}: held with no working close — (re)placing profit-close", p.strategy);
+                    if let Err(e) = self.place_profit_close(&ibkr, p, store).await {
+                        tracing::warn!("0DTE {}: reconcile profit-close failed: {e}", p.strategy);
+                    }
+                }
+            }
+        }
+    }
+
     /// React to a fill on a 0DTE auto-managed order: when the *entry* fills, place
     /// the standing profit-close (reversed combo bought at the target debit — "the
     /// wings are the stop", so no separate stop order); when the *close* fills,
@@ -1491,48 +1652,10 @@ impl App {
             match journal_status {
                 Some("filled") => {
                     let Some(ibkr) = self.ibkr.clone() else { return Ok(None) };
-                    let close_debit = (p.entry_credit * (1.0 - p.profit_target_pct)).max(0.0);
-                    let close_legs = reverse_legs(&decode_legs(&p.legs));
-                    // Buying the reversed package at +debit closes for profit; pass
-                    // the debit as a negative "credit" (the combo limit is negated).
-                    let order = ComboOrder {
-                        symbol: &p.underlying,
-                        expiry_yyyymmdd: &p.expiry,
-                        legs: &close_legs,
-                        quantity: p.quantity as i32,
-                        net_credit: -close_debit,
-                    };
-                    match ibkr.submit_or_preview_combo(&order, false).await {
-                        Ok(OrderOutcome::Submitted(close_oid)) => {
-                            store.update_zerodte_status(&p.entry_oid, "open", Some(&close_oid)).await?;
-                            let _ = store
-                                .record(&NewJournalEntry {
-                                    symbol: p.underlying.clone(),
-                                    action: format!("{} close", p.strategy),
-                                    quantity: p.quantity,
-                                    limit_price: Some(close_debit),
-                                    status: "submitted".into(),
-                                    ibkr_order_id: Some(close_oid.clone()),
-                                    note: Some(format!(
-                                        "AUTO profit-close @ {:.0}% (debit {:.2})",
-                                        p.profit_target_pct * 100.0,
-                                        close_debit
-                                    )),
-                                    ..Default::default()
-                                })
-                                .await;
-                            return Ok(Some(format!("⚡ {} filled → profit-close placed", p.strategy)));
-                        }
-                        Ok(OrderOutcome::Preview(_)) => {
-                            return Ok(Some(format!("{} close: unexpected preview", p.strategy)));
-                        }
-                        Err(e) => {
-                            // Entry is on; mark open without a close so a manual/retry
-                            // close is possible — the wings still cap the loss.
-                            store.update_zerodte_status(&p.entry_oid, "open", None).await?;
-                            return Ok(Some(format!("⚡ {} filled, profit-close failed: {e}", p.strategy)));
-                        }
-                    }
+                    return Ok(Some(match self.place_profit_close(&ibkr, p, store).await {
+                        Ok(_) => format!("⚡ {} filled → profit-close placed", p.strategy),
+                        Err(e) => format!("⚡ {} filled, profit-close failed: {e}", p.strategy),
+                    }));
                 }
                 Some(js @ ("cancelled" | "rejected")) => {
                     store.update_zerodte_status(&p.entry_oid, js, None).await?;
@@ -1744,6 +1867,7 @@ impl App {
                         Ok(open) => {
                             let bp = self.broker_positions.clone();
                             self.reconcile_pending_rolls(&open, &bp, store).await;
+                            self.reconcile_zerodte_positions(&open, &bp, store).await;
                             let mut w: Vec<String> = open.into_iter().map(|o| o.symbol).collect();
                             // Also suppress symbols with an in-flight roll whose
                             // close order may not be in the snapshot yet (just
@@ -1911,6 +2035,7 @@ impl App {
             if let Some(open) = &d.open_orders {
                 let bp = self.broker_positions.clone();
                 self.reconcile_pending_rolls(open, &bp, store).await;
+                self.reconcile_zerodte_positions(open, &bp, store).await;
             }
             // Keep any roll status the reconcile just set; otherwise settle to the
             // default connected status.
@@ -2078,6 +2203,54 @@ fn combo_legs_from(legs: &[StructureLeg]) -> Vec<ComboLeg> {
     out
 }
 
+/// The restart-reconcile verdict for one persisted 0DTE position, from whether its
+/// shorts are still held and whether its entry / close orders are still working.
+#[derive(Debug, PartialEq)]
+enum ZerodteReconcile {
+    /// Leave as-is (still working / consistent with the broker).
+    Leave,
+    /// Shorts gone → the position closed (or expired) while the app was down.
+    Closed,
+    /// No shorts and no working entry order → the entry never filled.
+    Cancelled,
+    /// Held but no working close → place (or re-place) the profit-close.
+    PlaceClose,
+}
+
+/// Pure restart-reconcile decision (see [`App::reconcile_zerodte_positions`]).
+fn reconcile_action(status: &str, held: bool, entry_open: bool, close_open: bool) -> ZerodteReconcile {
+    match status {
+        "pending" => {
+            if held && !close_open {
+                ZerodteReconcile::PlaceClose // entry filled while down
+            } else if !held && !entry_open {
+                ZerodteReconcile::Cancelled // entry never filled
+            } else {
+                ZerodteReconcile::Leave // entry still working
+            }
+        }
+        "open" | "closing" => {
+            if !held {
+                ZerodteReconcile::Closed // closed / expired while down
+            } else if !close_open {
+                ZerodteReconcile::PlaceClose // still held but the close vanished
+            } else {
+                ZerodteReconcile::Leave
+            }
+        }
+        _ => ZerodteReconcile::Leave,
+    }
+}
+
+/// Whether a structure's short legs are still held in broker positions — i.e. the
+/// entry filled and the position is open.
+fn structure_held(broker_positions: &[PositionRow], p: &ZeroDtePositionRow) -> bool {
+    decode_legs(&p.legs).iter().any(|l| {
+        l.action == Side::Sell
+            && position_has_short(broker_positions, &p.underlying, l.right, l.strike, &p.expiry)
+    })
+}
+
 fn journal_entry_for(sug: &Suggestion, expiry: &str, right_str: &str) -> NewJournalEntry {
     NewJournalEntry {
         symbol: sug.symbol.clone(),
@@ -2200,6 +2373,58 @@ mod tests {
         // Sizing edits persist too and re-rank without panicking.
         app.dispatch(Action::SlotRisk(2), &store).await.unwrap(); // +$500
         assert!((app.cfg.zerodte.strategies[0].max_risk - 4000.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn zerodte_reconcile_decisions() {
+        use ZerodteReconcile::*;
+        // pending: entry filled while down (held, no working close) → place close.
+        assert_eq!(reconcile_action("pending", true, false, false), PlaceClose);
+        // pending: no shorts and the entry order is gone → it never filled.
+        assert_eq!(reconcile_action("pending", false, false, false), Cancelled);
+        // pending: entry still working → leave.
+        assert_eq!(reconcile_action("pending", false, true, false), Leave);
+        // open: shorts gone → closed while we were down.
+        assert_eq!(reconcile_action("open", false, false, true), Closed);
+        // open: still held but the close vanished → re-place it.
+        assert_eq!(reconcile_action("open", true, false, false), PlaceClose);
+        // open: held with a working close → consistent, leave.
+        assert_eq!(reconcile_action("open", true, false, true), Leave);
+        // closing reconciles like open.
+        assert_eq!(reconcile_action("closing", false, false, false), Closed);
+    }
+
+    #[test]
+    fn structure_held_detects_short_legs() {
+        let p = ZeroDtePositionRow {
+            entry_oid: "1".into(),
+            slot: 0,
+            strategy: "IC".into(),
+            underlying: "SPX".into(),
+            expiry: "20260601".into(),
+            legs: "B:7480:P:1;S:7510:P:1;S:7635:C:1;B:7660:C:1".into(),
+            entry_credit: 4.6,
+            quantity: 1,
+            max_loss: 2540.0,
+            profit_target_pct: 0.4,
+            status: "open".into(),
+            close_oid: None,
+            entry_date: "2026-06-01".into(),
+            created_at: String::new(),
+        };
+        let short_put_held = vec![PositionRow {
+            account: "DU".into(),
+            symbol: "SPX".into(),
+            security_type: "Option".into(),
+            right: "P".into(),
+            strike: 7510.0,
+            expiry: "20260601".into(),
+            position: -1.0,
+            average_cost: 0.0,
+            multiplier: "100".into(),
+        }];
+        assert!(structure_held(&short_put_held, &p)); // a short leg is held → open
+        assert!(!structure_held(&[], &p)); // nothing held → closed
     }
 
     // --- shared test helpers ---

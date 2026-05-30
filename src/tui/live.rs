@@ -1049,5 +1049,15 @@ mod tests {
             Ok(OrderOutcome::Submitted(_)) => panic!("close preview unexpectedly transmitted!"),
             Err(e) => panic!("close combo preview failed: {e}"),
         }
+
+        // price_combo drives the stop-loss / time-stop checks: the cost to close a
+        // just-built structure should be ≈ the credit just received.
+        match ibkr.price_combo(&sug.symbol, &expiry, &combo).await {
+            Ok(cost) => eprintln!(
+                "PRICE_COMBO OK — cost-to-close {cost:.2} vs entry credit {:.2}",
+                sug.limit_price
+            ),
+            Err(e) => panic!("price_combo failed: {e}"),
+        }
     }
 }
