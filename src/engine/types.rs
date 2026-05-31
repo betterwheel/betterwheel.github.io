@@ -114,6 +114,78 @@ pub struct SharePosition {
     pub cost_basis: f64,
 }
 
+/// Which way a single structure leg trades.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LegSide {
+    Buy,
+    Sell,
+}
+
+/// One leg of a multi-leg structure (iron condor, butterfly, …). Plain data; the
+/// IBKR layer maps these into combo (BAG) legs at order time.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct StructureLeg {
+    pub right: Right,
+    pub strike: f64,
+    pub side: LegSide,
+    /// Per-share price (mid) of this leg when the structure was built.
+    pub price: f64,
+    /// Absolute delta of this leg, if known.
+    pub delta: Option<f64>,
+}
+
+/// A named multi-leg, short-dated (0–2 DTE) options structure. Unlike the wheel
+/// (which trades one short leg through an assignment lifecycle), these are
+/// market-neutral premium structures opened and closed within the trade's life.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StructureKind {
+    /// Short put spread + short call spread (defined risk both sides).
+    IronCondor,
+    /// One-sided bull put spread.
+    PutCreditSpread,
+    /// One-sided bear call spread.
+    CallCreditSpread,
+    /// Unequal-wing put butterfly, structured for a net credit (no upside risk).
+    BrokenWingButterfly,
+    /// ATM short straddle hedged by wings (max premium, narrow profit zone).
+    IronFly,
+    /// Naked short put + short call (undefined risk — gated behind config).
+    ShortStrangle,
+}
+
+impl StructureKind {
+    /// Human label for headers and journal rows.
+    pub fn label(self) -> &'static str {
+        match self {
+            StructureKind::IronCondor => "Iron Condor",
+            StructureKind::PutCreditSpread => "Put Credit Spread",
+            StructureKind::CallCreditSpread => "Call Credit Spread",
+            StructureKind::BrokenWingButterfly => "Broken-Wing Butterfly",
+            StructureKind::IronFly => "Iron Fly",
+            StructureKind::ShortStrangle => "Short Strangle",
+        }
+    }
+
+    /// Whether this structure carries undefined (naked) risk and so needs the
+    /// `allow_naked` gate and a naked option-trading permission tier.
+    pub fn is_naked(self) -> bool {
+        matches!(self, StructureKind::ShortStrangle)
+    }
+
+    /// Whether the delta-sum probability-of-profit estimate is meaningful here.
+    /// It only holds for OTM-short structures; a near-ATM body (iron fly) or a
+    /// butterfly needs a richer model, so the UI should not surface POP for those.
+    pub fn pop_is_meaningful(self) -> bool {
+        matches!(
+            self,
+            StructureKind::IronCondor
+                | StructureKind::PutCreditSpread
+                | StructureKind::CallCreditSpread
+                | StructureKind::ShortStrangle
+        )
+    }
+}
+
 /// The action the engine recommends.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ActionKind {
@@ -129,6 +201,12 @@ pub enum ActionKind {
     /// (further OTM) as protection. Caps max loss to the spread width minus the
     /// net credit. The Hedged Wheel's entry.
     SellPutSpread { long_strike: f64, long_price: f64 },
+    /// Open a multi-leg 0DTE/short-dated structure. `legs` is the full leg set in
+    /// execution order; the `Suggestion`'s scalar fields describe the primary
+    /// short leg (`strike`/`right`/`delta`), the net credit (`limit_price`), and
+    /// the defined max loss (`capital_required`). Breakevens / max-loss / POP are
+    /// derived from `legs` via [`crate::engine::structures`] helpers.
+    OpenStructure { kind: StructureKind, legs: Vec<StructureLeg> },
 }
 
 /// A single recommended action with everything needed to preview/execute it.

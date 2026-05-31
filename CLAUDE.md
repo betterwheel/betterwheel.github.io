@@ -25,6 +25,14 @@ backs store tests.
   Black-Scholes delta fallback in `math` (used when IBKR reports no greek), and
   plain `types`. `plan()` ranks suggestions: management (close, roll) before new
   entries, then by annualized yield. Fully unit-testable; keep it broker-agnostic.
+- `engine/structures/` — **a second strategy family: 0DTE/short-dated *index*
+  structures** (iron condor, put/call credit spread, broken-wing fly, iron fly,
+  gated short strangle). Pure selectors over a both-sides chain; a generic
+  piecewise-linear payoff engine (`payoff_at`/`max_loss_per_share`/`breakevens`)
+  derives risk/reward for any leg set. These ride on
+  `ActionKind::OpenStructure { kind, legs }` and are **not** part of the wheel's
+  `WheelState` machine (SPX is cash-settled/European — no assignment/shares,
+  intraday, multi-leg). Surfaced on the **0DTE tab** (a 2×2 grid of roster slots).
 - `ibkr/` — **the SOLE `ibapi` boundary.** Owns the `ibapi::Client` and maps
   `ibapi` types into plain structs (`PositionRow`, `ChainMeta`, `SnapshotData`,
   `OrderEvent`, …). Do not import `ibapi` anywhere else. Every streaming request
@@ -35,12 +43,14 @@ backs store tests.
   holdings → `WheelState` + share lot + open short. No I/O; exhaustively tested
   (it's the safety net for the connection-only path).
 - `store/` — SQLite persistence via `sqlx` (tables: `watchlist`,
-  `wheel_positions`, `journal`, `settings`; see `migrations/`). Migrations run
-  automatically on `Store::open`. Holds the wheel metadata IBKR can't report
-  (which leg, cost basis, cumulative premium). Broker-agnostic.
+  `wheel_positions`, `journal`, `settings`, `pending_rolls`, `zerodte_positions`
+  (auto-managed structures), `zerodte_settings` (in-app slot overrides); see
+  `migrations/`). Migrations run automatically on `Store::open`. Holds the wheel
+  metadata IBKR can't report (which leg, cost basis, cumulative premium).
 - `tui/` — `ratatui` app. `app.rs` = state + key→`Action` dispatch (async work),
   `ui.rs` = **pure render function of `App`**, `mod.rs` = `tokio::select!` run
-  loop (key events + broker order-event stream + redraw tick).
+  loop (key events + broker order-event stream + redraw + a 30s 0DTE scheduler
+  tick), `schedule.rs` = **pure** US/Eastern market-time + entry-timing helpers.
 - `config.rs` — TOML config (connection, engine tuning, guardrails); every field
   defaults, so a missing `config.toml` still runs. See `config.toml.example`.
 
@@ -60,6 +70,13 @@ Data flow when connected: `ibkr.positions()` → `positions::reconcile` → sync
   timeout before `PositionEnd`). Callers must treat that as "unknown", never as
   "account is empty" — a failed fetch must not wipe wheel state or surface stale
   executable suggestions. Preserve this distinction in any refactor.
+- **0DTE auto-management is opt-in per slot.** The scheduler (`app::tick_zerodte`,
+  a run-loop tick) transmits *only* for a slot whose `automate` flag is on (toggled
+  in-app with `t` on the 0DTE tab, persisted to `zerodte_settings`), and still
+  honors `read_only` + `max_contracts_per_order`. It enters at the configured time
+  and places a **standing profit-close** on fill; "the wings are the stop" (no
+  separate stop order for defined-risk structures). A loud "⚡ AUTO-TRADING" header
+  banner shows whenever a slot is live. **Default off** — do not weaken this gate.
 
 ## Conventions & gotchas
 
@@ -83,6 +100,15 @@ Data flow when connected: `ibkr.positions()` → `positions::reconcile` → sync
   the contract multiplier, so per-share credit = `average_cost / multiplier`
   (see `positions.rs`). Expiries are `YYYYMMDD`; contract-month-only expiries are
   dropped (can't be dated).
+- **Index options (SPX / 0DTE) differ from stocks**, all handled in `ibkr/`:
+  resolve the underlying as `SecurityType::Index` (`underlying_contract`);
+  `option_chain` **unions all trading classes** so the SPXW dailies (where 0DTE
+  lives) come in — taking only the first stream entry misses every same-day
+  expiry; and index order prices tick in **$0.05**, not $0.01 — an off-tick combo
+  limit gets IBKR error 110 and the request *hangs* (`round_to_tick`/`order_tick`).
+  Multi-leg structures submit as one **guaranteed** combo (BAG) via
+  `submit_or_preview_combo`; the profit-close is the entry combo with every leg
+  flipped, bought at the target debit.
 - Secrets are gitignored: `config.toml` and `*.pem` are never committed.
 - `docs/legacy-webapi/` is **archived** (an abandoned Web API/OAuth broker layer);
   the live broker layer is TWS-via-`ibapi`. Don't treat it as current code.

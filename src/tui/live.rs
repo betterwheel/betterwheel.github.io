@@ -8,13 +8,13 @@
 use anyhow::Result;
 use chrono::NaiveDate;
 
-use crate::config::Config;
+use crate::config::{Config, ZeroDteConfig};
 use crate::engine::math::round_cents;
 use crate::engine::types::{
     ActionKind, EngineConfig, OpenShortOption, OptionQuote, Right, SharePosition, Suggestion,
     UnderlyingQuote, WheelState,
 };
-use crate::engine::{self, SymbolContext};
+use crate::engine::{self, structures, SymbolContext};
 use crate::ibkr::{AccountSnapshot, Ibkr, OpenOrderInfo, PositionRow, Tradability};
 use crate::positions;
 use crate::store::{JournalRow, Store, WatchlistRow, WheelPositionRow};
@@ -28,6 +28,21 @@ const MAX_OTM_MONEYNESS: f64 = 0.15;
 const MAX_CHAIN_STRIKES: usize = 12;
 /// Far-OTM put target (fraction of spot) used by the tradability permission probe.
 const PROBE_OTM_FRACTION: f64 = 0.85;
+/// Strikes near spot (within this fraction, each side) considered for a 0DTE
+/// structure. Kept tight: a same-day short sits ~1% OTM and its wing a little
+/// further, so a wide band wastes the strike budget on far strikes that never get
+/// picked and leaves the relevant near-ATM grid too coarse to hit the delta
+/// target or the exact wing.
+const STRUCTURE_OTM_MONEYNESS: f64 = 0.025;
+/// Cap on the strike sample for a 0DTE structure (×2 rights → snapshot count).
+/// Spread across the tight band above, this gives ~10pt resolution on SPX —
+/// fine enough that a points-width wing lands near its target rather than
+/// overshooting and inflating max-loss past the risk budget.
+const MAX_STRUCTURE_STRIKES: usize = 40;
+/// Snapshot concurrency cap for the structure chain. Index 0DTE chains are wide
+/// and bursting all legs at once overruns the account's market-data lines (so
+/// many silently fail); fetch in bounded chunks instead.
+const STRUCTURE_SNAPSHOT_CHUNK: usize = 16;
 
 /// Everything an off-loop reload gathers from the broker + store, to be applied
 /// to the `App` back on the event loop. Mirrors the *connected* branch of
@@ -42,6 +57,8 @@ pub(super) struct LiveData {
     pub suggestions: Vec<Suggestion>,
     /// Hedged Wheel suggestions (defined-risk put spreads), from the same fetch.
     pub hedged_suggestions: Vec<Suggestion>,
+    /// 0DTE structure suggestions, one per configured quadrant slot.
+    pub zerodte_suggestions: Vec<Option<Suggestion>>,
     /// Authoritative open orders, or `None` if that snapshot failed.
     pub open_orders: Option<Vec<OpenOrderInfo>>,
     /// `false` when the positions snapshot was incomplete: the caller must NOT
@@ -102,6 +119,15 @@ pub(super) async fn gather(
     let journal = store.recent_journal(200).await.unwrap_or_default();
     let positions = store.list_positions().await.unwrap_or_default();
 
+    // 0DTE structures don't depend on existing positions, but gate them on a
+    // complete snapshot too so nothing executable shows while broker state is
+    // unknown (mirrors how the wheel suggestions are cleared on a failed fetch).
+    let zerodte_suggestions = if positions_ok {
+        structure_suggestions(ibkr, &cfg.zerodte, cfg.engine.risk_free_rate, today).await
+    } else {
+        Vec::new()
+    };
+
     LiveData {
         account,
         watchlist,
@@ -110,9 +136,129 @@ pub(super) async fn gather(
         broker_positions,
         suggestions,
         hedged_suggestions,
+        zerodte_suggestions,
         open_orders,
         positions_ok,
     }
+}
+
+/// One ranked structure per 0DTE-tab slot (`None` where nothing fits), each from
+/// a freshly-fetched both-sides index chain at the slot's target DTE. Slots are
+/// fetched sequentially (each fans its strike snapshots out concurrently) to keep
+/// the simultaneous market-data line count bounded.
+pub(super) async fn structure_suggestions(
+    ibkr: &Ibkr,
+    zerodte: &ZeroDteConfig,
+    risk_free_rate: f64,
+    today: NaiveDate,
+) -> Vec<Option<Suggestion>> {
+    let mut out = Vec::with_capacity(zerodte.slot_count());
+    for i in 0..zerodte.slot_count() {
+        let Some(p) = zerodte.slot(i) else {
+            out.push(None);
+            continue;
+        };
+        match gather_structure_chain(ibkr, &p.underlying, p.dte, today).await {
+            Ok(Some((spot, quotes))) => {
+                out.push(structures::select(
+                    p,
+                    &p.underlying,
+                    spot,
+                    &quotes,
+                    today,
+                    risk_free_rate,
+                ));
+            }
+            Ok(None) => out.push(None),
+            Err(e) => {
+                tracing::warn!("0DTE chain for {} ({}): {e}", p.name, p.underlying);
+                out.push(None);
+            }
+        }
+    }
+    out
+}
+
+/// Fetch spot + a both-sides (put & call) near-ATM chain at the target DTE for a
+/// 0DTE structure. Unlike the wheel's one-right [`gather_chain_quotes`], this
+/// quotes both rights (the structures straddle the money) and allows same-day
+/// expiry (`min_dte = 0`).
+async fn gather_structure_chain(
+    ibkr: &Ibkr,
+    symbol: &str,
+    dte: i64,
+    today: NaiveDate,
+) -> Result<Option<(f64, Vec<OptionQuote>)>> {
+    let conid = ibkr.underlying_contract_id(symbol).await?;
+    let chain = ibkr.option_chain(symbol, conid).await?;
+    if chain.expirations.is_empty() || chain.strikes.is_empty() {
+        return Ok(None);
+    }
+    let Some((expiry_str, _)) = pick_expiry(&chain.expirations, today, dte, 0) else {
+        return Ok(None); // no listed expiry at/after the target — skip this cycle
+    };
+    let expiry_date = NaiveDate::parse_from_str(&expiry_str, "%Y%m%d")?;
+
+    let spot = ibkr.underlying_snapshot(symbol).await?.last.unwrap_or(0.0);
+    if spot <= 0.0 {
+        return Ok(None);
+    }
+
+    // Strikes within a tight band each side of spot, sampled across the range so
+    // both shorts and their wings are covered (the selector adapts to whatever is
+    // listed). Both rights are quoted at each sampled strike.
+    let mut near: Vec<f64> = chain
+        .strikes
+        .iter()
+        .copied()
+        .filter(|k| *k > 0.0 && ((spot - *k).abs() / spot) <= STRUCTURE_OTM_MONEYNESS)
+        .collect();
+    near.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let strikes = sample_spread(&near, MAX_STRUCTURE_STRIKES);
+    if strikes.is_empty() {
+        return Ok(None);
+    }
+
+    // (strike, right) request grid, fetched concurrently in bounded chunks so we
+    // don't overrun the account's simultaneous market-data lines.
+    let reqs: Vec<(f64, Right)> = strikes
+        .iter()
+        .flat_map(|&k| [Right::Put, Right::Call].into_iter().map(move |r| (k, r)))
+        .collect();
+    let mut snaps = Vec::with_capacity(reqs.len());
+    for chunk in reqs.chunks(STRUCTURE_SNAPSHOT_CHUNK) {
+        let part = futures::future::join_all(
+            chunk
+                .iter()
+                .map(|(k, r)| ibkr.option_snapshot(symbol, &expiry_str, *k, right_char(*r))),
+        )
+        .await;
+        snaps.extend(part);
+    }
+
+    let mut quotes: Vec<OptionQuote> = Vec::with_capacity(reqs.len());
+    for ((k, r), snap) in reqs.iter().zip(snaps) {
+        if let Ok(snap) = snap
+            && let Some(comp) = snap.comp
+        {
+            let price = comp.option_price.or(snap.last).unwrap_or(0.0);
+            if price > 0.0 {
+                quotes.push(OptionQuote {
+                    right: *r,
+                    strike: *k,
+                    expiry: expiry_date,
+                    bid: price,
+                    ask: price,
+                    delta: comp.delta,
+                    implied_volatility: comp.implied_volatility,
+                    open_interest: None,
+                    volume: None,
+                });
+            }
+        }
+    }
+
+    Ok(Some((spot, quotes)))
 }
 
 /// One-shot price for an option leg (used to value a roll's new leg): model
@@ -187,7 +333,7 @@ async fn probe_one_tradability(
         return Ok(());
     }
 
-    let Some((expiry, _)) = pick_expiry(&chain.expirations, today, 35) else {
+    let Some((expiry, _)) = pick_expiry(&chain.expirations, today, 35, 1) else {
         return Ok(()); // no future expiry right now — retry next refresh
     };
     let spot = ibkr.underlying_snapshot(symbol).await?.last.unwrap_or(0.0);
@@ -283,7 +429,7 @@ pub(super) async fn resolve_roll_target(
         return Ok(None);
     }
     let target_dte = (to_expiry - today).num_days().max(1);
-    let Some((expiry, _)) = pick_expiry(&chain.expirations, today, target_dte) else {
+    let Some((expiry, _)) = pick_expiry(&chain.expirations, today, target_dte, 1) else {
         return Ok(None);
     };
     let Some(strike) = nearest_strike(&chain.strikes, to_strike) else {
@@ -475,7 +621,7 @@ async fn gather_chain_quotes(
     }
 
     let target_dte = (cfg.min_dte + cfg.max_dte) / 2;
-    let Some((expiry_str, _)) = pick_expiry(&chain.expirations, today, target_dte) else {
+    let Some((expiry_str, _)) = pick_expiry(&chain.expirations, today, target_dte, 1) else {
         return Ok(None);
     };
     let expiry_date = NaiveDate::parse_from_str(&expiry_str, "%Y%m%d")?;
@@ -637,8 +783,15 @@ fn moneyness(right: Right, strike: f64, spot: f64) -> f64 {
     }
 }
 
-/// Pick the expiration closest to `target_dte` days out.
-fn pick_expiry(expirations: &[String], today: NaiveDate, target_dte: i64) -> Option<(String, i64)> {
+/// Pick the expiration closest to `target_dte` days out, considering only
+/// expiries at least `min_dte` days away. The wheel passes `min_dte = 1` (never
+/// same-day); the 0DTE path passes `0` so same-day expiries qualify.
+fn pick_expiry(
+    expirations: &[String],
+    today: NaiveDate,
+    target_dte: i64,
+    min_dte: i64,
+) -> Option<(String, i64)> {
     expirations
         .iter()
         .filter_map(|e| {
@@ -646,7 +799,7 @@ fn pick_expiry(expirations: &[String], today: NaiveDate, target_dte: i64) -> Opt
                 .ok()
                 .map(|d| (e.clone(), (d - today).num_days()))
         })
-        .filter(|(_, dte)| *dte >= 1)
+        .filter(|(_, dte)| *dte >= min_dte)
         .min_by_key(|(_, dte)| (dte - target_dte).abs())
 }
 
@@ -753,7 +906,7 @@ mod tests {
             "20260703".to_string(),
             "20260919".to_string(),
         ];
-        let (chosen, dte) = pick_expiry(&exps, today, 35).expect("an expiry");
+        let (chosen, dte) = pick_expiry(&exps, today, 35, 1).expect("an expiry");
         assert_eq!(chosen, "20260703");
         assert_eq!(dte, 32);
     }
@@ -762,8 +915,21 @@ mod tests {
     fn pick_expiry_skips_past_dates() {
         let today = NaiveDate::from_ymd_opt(2026, 6, 1).unwrap();
         let exps = vec!["20260101".to_string(), "20260630".to_string()];
-        let (chosen, _) = pick_expiry(&exps, today, 35).expect("a future expiry");
+        let (chosen, _) = pick_expiry(&exps, today, 35, 1).expect("a future expiry");
         assert_eq!(chosen, "20260630");
+    }
+
+    #[test]
+    fn pick_expiry_min_dte_zero_allows_today() {
+        let today = NaiveDate::from_ymd_opt(2026, 6, 1).unwrap();
+        let exps = vec!["20260601".to_string(), "20260603".to_string()];
+        // 0DTE path (min_dte = 0, target 0) selects today's expiry...
+        let (same_day, dte) = pick_expiry(&exps, today, 0, 0).expect("a 0DTE expiry");
+        assert_eq!(same_day, "20260601");
+        assert_eq!(dte, 0);
+        // ...while the wheel path (min_dte = 1) skips it for the next listed date.
+        let (next, _) = pick_expiry(&exps, today, 0, 1).expect("a future expiry");
+        assert_eq!(next, "20260603");
     }
 
     #[test]
@@ -778,5 +944,120 @@ mod tests {
         assert_eq!(sample_spread(&[1.0, 2.0], 5), vec![1.0, 2.0]);
         assert_eq!(sample_spread(&[], 5), Vec::<f64>::new());
         assert_eq!(sample_spread(&[1.0, 2.0, 3.0], 1), vec![1.0]);
+    }
+
+    /// Read-only live smoke test of the full 0DTE path: connect → resolve the
+    /// index → fetch a both-sides near-term chain (incl. SPXW dailies) → run the
+    /// real selectors. Never transmits. Ignored by default; run against a live
+    /// paper Gateway with:
+    ///   cargo test --lib live_zerodte_smoke -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore = "requires a running IB Gateway (read-only)"]
+    async fn live_zerodte_smoke() {
+        let cfg = Config::load(std::path::Path::new("config.toml")).expect("load config.toml");
+        let ibkr = crate::ibkr::Ibkr::connect(&cfg.connection)
+            .await
+            .expect("connect to IB Gateway");
+        let today = chrono::Local::now().date_naive();
+
+        let out = structure_suggestions(&ibkr, &cfg.zerodte, cfg.engine.risk_free_rate, today).await;
+        assert_eq!(out.len(), cfg.zerodte.slot_count());
+        for (i, slot) in out.iter().enumerate() {
+            let name = cfg.zerodte.slot(i).map(|q| q.name.as_str()).unwrap_or("?");
+            match slot {
+                Some(s) => eprintln!(
+                    "slot {i} [{name}] {}DTE: credit ${:.0}  max loss ${:.0}  x{}",
+                    s.dte, s.premium_total, s.capital_required, s.quantity
+                ),
+                None => eprintln!("slot {i} [{name}]: no structure fit"),
+            }
+        }
+    }
+
+    /// Read-only what-if of the first live structure as an N-leg combo: resolves
+    /// every leg's contract and runs `.analyze()` (never transmits), confirming
+    /// IBKR accepts the BAG and returns a margin ≈ the structure's max loss.
+    ///   cargo test --lib live_combo_preview -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore = "requires a running IB Gateway (read-only)"]
+    async fn live_combo_preview() {
+        use crate::engine::types::{ActionKind, LegSide};
+        use crate::ibkr::{ComboLeg, ComboOrder, OrderOutcome, Side};
+
+        let cfg = Config::load(std::path::Path::new("config.toml")).expect("config");
+        let ibkr = crate::ibkr::Ibkr::connect(&cfg.connection).await.expect("connect");
+        let today = chrono::Local::now().date_naive();
+        let out = structure_suggestions(&ibkr, &cfg.zerodte, cfg.engine.risk_free_rate, today).await;
+        let sug = out.iter().flatten().next().expect("at least one structure built");
+        let ActionKind::OpenStructure { kind, legs } = &sug.kind else { panic!("not a structure") };
+        eprintln!("previewing {} ×{}: {} legs, net credit {:.2}", kind.label(), sug.quantity, legs.len(), sug.limit_price);
+
+        // Merge legs → combo legs (mirrors app::combo_legs_from).
+        let mut combo: Vec<ComboLeg> = Vec::new();
+        for l in legs {
+            let right = if l.right == Right::Put { "P" } else { "C" };
+            let action = if l.side == LegSide::Sell { Side::Sell } else { Side::Buy };
+            if let Some(c) = combo.iter_mut().find(|c| (c.strike - l.strike).abs() < 1e-6 && c.right == right && c.action == action) {
+                c.ratio += 1;
+            } else {
+                combo.push(ComboLeg { strike: l.strike, right, action, ratio: 1 });
+            }
+        }
+        for c in &combo {
+            eprintln!("  {:?} {:.0}{} x{}", c.action, c.strike, c.right, c.ratio);
+        }
+        let expiry = sug.expiry.format("%Y%m%d").to_string();
+        let order = ComboOrder {
+            symbol: &sug.symbol,
+            expiry_yyyymmdd: &expiry,
+            legs: &combo,
+            quantity: sug.quantity,
+            net_credit: sug.limit_price,
+        };
+        match ibkr.submit_or_preview_combo(&order, true).await {
+            Ok(OrderOutcome::Preview(state)) => eprintln!(
+                "ENTRY PREVIEW OK — status={} init_margin={:?} commission={:?} (struct max loss ${:.0})",
+                state.status, state.initial_margin_after, state.commission, sug.capital_required
+            ),
+            Ok(OrderOutcome::Submitted(_)) => panic!("preview unexpectedly transmitted!"),
+            Err(e) => panic!("combo preview failed: {e}"),
+        }
+
+        // Also verify the profit-close: reverse every leg and buy the package back
+        // at the 40%-profit debit (the exact construction the scheduler uses on an
+        // entry fill). Read-only — confirms IBKR accepts the reversed BAG + sign.
+        let close_legs: Vec<ComboLeg> = combo
+            .iter()
+            .map(|l| ComboLeg {
+                action: if l.action == Side::Buy { Side::Sell } else { Side::Buy },
+                ..*l
+            })
+            .collect();
+        let close_debit = sug.limit_price * 0.60;
+        let close = ComboOrder {
+            symbol: &sug.symbol,
+            expiry_yyyymmdd: &expiry,
+            legs: &close_legs,
+            quantity: sug.quantity,
+            net_credit: -close_debit, // a debit close: negated into a +debit limit
+        };
+        match ibkr.submit_or_preview_combo(&close, true).await {
+            Ok(OrderOutcome::Preview(state)) => eprintln!(
+                "CLOSE PREVIEW OK — status={} (buy-to-close debit {:.2}, keeps {:.2} of {:.2})",
+                state.status, close_debit, sug.limit_price - close_debit, sug.limit_price
+            ),
+            Ok(OrderOutcome::Submitted(_)) => panic!("close preview unexpectedly transmitted!"),
+            Err(e) => panic!("close combo preview failed: {e}"),
+        }
+
+        // price_combo drives the stop-loss / time-stop checks: the cost to close a
+        // just-built structure should be ≈ the credit just received.
+        match ibkr.price_combo(&sug.symbol, &expiry, &combo).await {
+            Ok(cost) => eprintln!(
+                "PRICE_COMBO OK — cost-to-close {cost:.2} vs entry credit {:.2}",
+                sug.limit_price
+            ),
+            Err(e) => panic!("price_combo failed: {e}"),
+        }
     }
 }
