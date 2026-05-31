@@ -7,7 +7,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::engine::types::EngineConfig;
+use crate::engine::structures::StructureParams;
+use crate::engine::types::{EngineConfig, StructureKind};
 
 /// Top-level application configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -17,6 +18,8 @@ pub struct Config {
     pub connection: ConnectionConfig,
     pub engine: EngineConfig,
     pub guardrails: Guardrails,
+    /// 0DTE/short-dated structure roster + the four 0DTE-tab quadrant slots.
+    pub zerodte: ZeroDteConfig,
     /// Where the SQLite db and logs live. Defaults to the OS data dir.
     pub data_dir: Option<PathBuf>,
 }
@@ -176,6 +179,164 @@ impl Default for Guardrails {
     }
 }
 
+/// The 0DTE/short-dated structure roster and the four quadrant assignments shown
+/// on the 0DTE tab. `strategies` are named, parameterized structures (TOML
+/// `[[zerodte.strategy]]`); `slots` picks, by roster index, which structure each
+/// of the four quadrants displays.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ZeroDteConfig {
+    #[serde(rename = "strategy")]
+    pub strategies: Vec<StructureParams>,
+    /// Quadrant → roster-index assignments (the first four are shown).
+    pub slots: Vec<usize>,
+}
+
+impl Default for ZeroDteConfig {
+    fn default() -> Self {
+        // Seeded from the r/thetagang 0DTE thread: a neutral condor, a one-sided
+        // credit spread (with a stop), a no-upside-risk broken-wing fly, and a
+        // max-premium iron fly. Stops default to 0 ("the wings are the stop")
+        // except the directional spread.
+        Self {
+            strategies: vec![
+                StructureParams {
+                    name: "Iron Condor".into(),
+                    kind: StructureKind::IronCondor,
+                    dte: 0,
+                    short_delta: 0.13,
+                    call_delta: 0.13,
+                    wing_points: 25.0,
+                    min_credit: 0.80,
+                    // SPX 25pt wings risk ~$2–2.8k/contract; give headroom so one
+                    // contract clears the budget on the index's wide strikes.
+                    max_risk: 3500.0,
+                    entry_minutes_after_open: 45,
+                    profit_target_pct: 0.40,
+                    stop_loss_mult: 0.0,
+                    ..Default::default()
+                },
+                StructureParams {
+                    name: "Put Credit Spread".into(),
+                    kind: StructureKind::PutCreditSpread,
+                    dte: 1,
+                    short_delta: 0.11,
+                    wing_points: 10.0,
+                    min_credit: 0.30,
+                    max_risk: 1500.0,
+                    entry_minutes_after_open: 45,
+                    profit_target_pct: 0.40,
+                    stop_loss_mult: 1.2,
+                    ..Default::default()
+                },
+                StructureParams {
+                    name: "Broken-Wing Fly".into(),
+                    kind: StructureKind::BrokenWingButterfly,
+                    dte: 0,
+                    // Near-the-money body with a narrow upper wing is what lets a
+                    // 1-2-1 put fly price to a credit (the lower skip is 3×).
+                    short_delta: 0.32,
+                    wing_points: 10.0,
+                    min_credit: 0.10,
+                    max_risk: 2000.0,
+                    entry_minutes_after_open: 30,
+                    profit_target_pct: 0.50,
+                    stop_loss_mult: 0.0,
+                    ..Default::default()
+                },
+                StructureParams {
+                    name: "Iron Fly".into(),
+                    kind: StructureKind::IronFly,
+                    dte: 0,
+                    wing_points: 30.0,
+                    min_credit: 2.00,
+                    max_risk: 2500.0,
+                    entry_minutes_after_open: 30,
+                    profit_target_pct: 0.25,
+                    stop_loss_mult: 0.0,
+                    ..Default::default()
+                },
+            ],
+            slots: vec![0, 1, 2, 3],
+        }
+    }
+}
+
+impl ZeroDteConfig {
+    /// The structure assigned to quadrant `i` (0–3), if the slot and roster index
+    /// both resolve.
+    pub fn slot(&self, i: usize) -> Option<&StructureParams> {
+        self.slots.get(i).and_then(|&idx| self.strategies.get(idx))
+    }
+
+    /// How many quadrants to render (the 2×2 grid shows at most four).
+    pub fn slot_count(&self) -> usize {
+        self.slots.len().min(4)
+    }
+}
+
+/// Live, in-app overrides for the 0DTE roster — the subset of slot params
+/// editable from the 0DTE tab (the safety-critical `automate` opt-in plus sizing
+/// and profit target). Persisted to the store and overlaid onto the config.toml
+/// roster at startup, mirroring how [`UserSettings`] overrides `[engine]`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ZeroDteSettings {
+    #[serde(rename = "override")]
+    pub overrides: Vec<SlotOverride>,
+}
+
+/// One roster slot's in-app overrides, keyed by roster index.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SlotOverride {
+    pub index: usize,
+    pub automate: bool,
+    pub max_risk: f64,
+    pub profit_target_pct: f64,
+}
+
+impl ZeroDteSettings {
+    /// Snapshot the editable fields of every roster slot, so persisting after a
+    /// single edit captures the whole live state.
+    pub fn snapshot(cfg: &ZeroDteConfig) -> Self {
+        Self {
+            overrides: cfg
+                .strategies
+                .iter()
+                .enumerate()
+                .map(|(index, p)| SlotOverride {
+                    index,
+                    automate: p.automate,
+                    max_risk: p.max_risk,
+                    profit_target_pct: p.profit_target_pct,
+                })
+                .collect(),
+        }
+    }
+
+    /// Overlay the saved edits onto a roster by index; out-of-range entries are
+    /// ignored, so a shrunk roster is safe.
+    pub fn apply_to(&self, cfg: &mut ZeroDteConfig) {
+        for o in &self.overrides {
+            if let Some(p) = cfg.strategies.get_mut(o.index) {
+                p.automate = o.automate;
+                p.max_risk = o.max_risk;
+                p.profit_target_pct = o.profit_target_pct;
+            }
+        }
+    }
+
+    /// Parse a persisted blob; malformed input falls back to no overrides.
+    pub fn parse(blob: &str) -> Option<Self> {
+        toml::from_str(blob).ok()
+    }
+
+    /// Serialize for persistence.
+    pub fn to_blob(&self) -> String {
+        toml::to_string(self).unwrap_or_default()
+    }
+}
+
 impl Config {
     /// Load config from `path`. A missing file yields defaults.
     pub fn load(path: &Path) -> anyhow::Result<Config> {
@@ -243,5 +404,57 @@ mod tests {
         assert_eq!(parsed, s);
         // Garbage falls back to None so corrupt settings never wedge startup.
         assert!(UserSettings::parse("not valid toml = = =").is_none());
+    }
+
+    #[test]
+    fn zerodte_defaults_seed_four_slots() {
+        let z = ZeroDteConfig::default();
+        assert_eq!(z.strategies.len(), 4);
+        assert_eq!(z.slot_count(), 4);
+        assert_eq!(z.slot(0).unwrap().kind, StructureKind::IronCondor);
+        assert_eq!(z.slot(3).unwrap().kind, StructureKind::IronFly);
+        assert!(z.slot(9).is_none());
+    }
+
+    #[test]
+    fn config_loads_partial_zerodte_toml() {
+        // A roster entry needs only the fields it overrides; the rest default.
+        let toml = r#"
+[[zerodte.strategy]]
+name = "My Condor"
+kind = "IronCondor"
+short_delta = 0.10
+"#;
+        let cfg: Config = toml::from_str(toml).expect("parse");
+        assert_eq!(cfg.zerodte.strategies.len(), 1);
+        assert_eq!(cfg.zerodte.strategies[0].name, "My Condor");
+        assert!((cfg.zerodte.strategies[0].short_delta - 0.10).abs() < 1e-9);
+        assert_eq!(cfg.zerodte.strategies[0].kind, StructureKind::IronCondor);
+        // A defaulted field still carries the StructureParams default.
+        assert_eq!(cfg.zerodte.strategies[0].profit_target_pct, 0.40);
+    }
+
+    #[test]
+    fn zerodte_overrides_roundtrip_and_apply() {
+        let mut cfg = ZeroDteConfig::default();
+        // Simulate in-app edits: automate slot 0, retune its sizing/profit.
+        cfg.strategies[0].automate = true;
+        cfg.strategies[0].max_risk = 4000.0;
+        cfg.strategies[0].profit_target_pct = 0.25;
+
+        let blob = ZeroDteSettings::snapshot(&cfg).to_blob();
+        let parsed = ZeroDteSettings::parse(&blob).expect("roundtrip");
+
+        // Applying onto a fresh (config.toml) roster restores the live edits, while
+        // leaving non-overlaid fields (delta, wings) from the config.
+        let mut fresh = ZeroDteConfig::default();
+        assert!(!fresh.strategies[0].automate);
+        parsed.apply_to(&mut fresh);
+        assert!(fresh.strategies[0].automate);
+        assert_eq!(fresh.strategies[0].max_risk, 4000.0);
+        assert_eq!(fresh.strategies[0].profit_target_pct, 0.25);
+        assert_eq!(fresh.strategies[0].short_delta, 0.13); // untouched, from config
+        // Garbage falls back gracefully.
+        assert!(ZeroDteSettings::parse("== not toml ==").is_none());
     }
 }
