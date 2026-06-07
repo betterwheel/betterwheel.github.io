@@ -9,13 +9,13 @@ use anyhow::Result;
 use chrono::NaiveDate;
 
 use crate::config::{Config, ZeroDteConfig};
-use crate::engine::math::round_cents;
+use crate::engine::math::{fcmp, round_cents};
 use crate::engine::types::{
     ActionKind, EngineConfig, OpenShortOption, OptionQuote, Right, SharePosition, Suggestion,
     UnderlyingQuote, WheelState,
 };
 use crate::engine::{self, structures, SymbolContext};
-use crate::ibkr::{AccountSnapshot, Ibkr, OpenOrderInfo, PositionRow, Tradability};
+use crate::ibkr::{AccountSnapshot, Ibkr, OpenOrderInfo, PositionRow, SnapshotData, Tradability};
 use crate::positions;
 use crate::store::{JournalRow, Store, WatchlistRow, WheelPositionRow};
 
@@ -45,9 +45,10 @@ const MAX_STRUCTURE_STRIKES: usize = 40;
 const STRUCTURE_SNAPSHOT_CHUNK: usize = 16;
 
 /// Everything an off-loop reload gathers from the broker + store, to be applied
-/// to the `App` back on the event loop. Mirrors the *connected* branch of
-/// `App::reload` (which stays inline, for startup only) so the heavy broker I/O
-/// — chains, snapshots, the tradability probe — never runs on the UI thread.
+/// to the `App` back on the event loop by `App::apply_live_data`. This is the
+/// single connected-reload pipeline — the heavy broker I/O (chains, snapshots,
+/// the tradability probe) never runs on the UI thread, and `App::reload`'s
+/// synchronous fallback delegates here too rather than duplicating it.
 pub(super) struct LiveData {
     pub account: Option<AccountSnapshot>,
     pub watchlist: Vec<WatchlistRow>,
@@ -213,7 +214,7 @@ async fn gather_structure_chain(
         .copied()
         .filter(|k| *k > 0.0 && ((spot - *k).abs() / spot) <= STRUCTURE_OTM_MONEYNESS)
         .collect();
-    near.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    near.sort_by(fcmp);
     let strikes = sample_spread(&near, MAX_STRUCTURE_STRIKES);
     if strikes.is_empty() {
         return Ok(None);
@@ -230,7 +231,7 @@ async fn gather_structure_chain(
         let part = futures::future::join_all(
             chunk
                 .iter()
-                .map(|(k, r)| ibkr.option_snapshot(symbol, &expiry_str, *k, right_char(*r))),
+                .map(|(k, r)| ibkr.option_snapshot(symbol, &expiry_str, *k, r.code())),
         )
         .await;
         snaps.extend(part);
@@ -239,26 +240,41 @@ async fn gather_structure_chain(
     let mut quotes: Vec<OptionQuote> = Vec::with_capacity(reqs.len());
     for ((k, r), snap) in reqs.iter().zip(snaps) {
         if let Ok(snap) = snap
-            && let Some(comp) = snap.comp
+            && let Some(q) = quote_from_snapshot(&snap, *r, *k, expiry_date)
         {
-            let price = comp.option_price.or(snap.last).unwrap_or(0.0);
-            if price > 0.0 {
-                quotes.push(OptionQuote {
-                    right: *r,
-                    strike: *k,
-                    expiry: expiry_date,
-                    bid: price,
-                    ask: price,
-                    delta: comp.delta,
-                    implied_volatility: comp.implied_volatility,
-                    open_interest: None,
-                    volume: None,
-                });
-            }
+            quotes.push(q);
         }
     }
 
     Ok(Some((spot, quotes)))
+}
+
+/// Build an [`OptionQuote`] from a snapshot at `(right, strike, expiry)`, or
+/// `None` when the contract has no usable price this cycle. The single source for
+/// the `model price → last` fallback and the bid==ask==price convention every
+/// chain gatherer shares; greeks ride along from the snapshot, while
+/// open-interest isn't in the snapshot feed so it's left empty.
+fn quote_from_snapshot(
+    snap: &SnapshotData,
+    right: Right,
+    strike: f64,
+    expiry: NaiveDate,
+) -> Option<OptionQuote> {
+    let comp = snap.comp.as_ref()?;
+    let price = comp.option_price.or(snap.last)?;
+    if price <= 0.0 {
+        return None;
+    }
+    Some(OptionQuote {
+        right,
+        strike,
+        expiry,
+        bid: price,
+        ask: price,
+        delta: comp.delta,
+        implied_volatility: comp.implied_volatility,
+        open_interest: None,
+    })
 }
 
 /// One-shot price for an option leg (used to value a roll's new leg): model
@@ -390,7 +406,7 @@ fn far_otm_put_strike(strikes: &[f64], spot: f64) -> Option<f64> {
         if s.is_empty() {
             return None;
         }
-        s.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        s.sort_by(fcmp);
         s[s.len() / 2]
     };
     nearest_strike(strikes, target)
@@ -403,10 +419,7 @@ fn nearest_strike(strikes: &[f64], target: f64) -> Option<f64> {
         .copied()
         .filter(|k| *k > 0.0)
         .min_by(|a, b| {
-            (a - target)
-                .abs()
-                .partial_cmp(&(b - target).abs())
-                .unwrap_or(std::cmp::Ordering::Equal)
+            fcmp(&(a - target).abs(), &(b - target).abs())
         })
 }
 
@@ -470,9 +483,14 @@ pub(super) async fn live_suggestions(
         return (Vec::new(), Vec::new());
     }
     // Size new-entry collateral against the symbols actually eligible to open
-    // one (enabled and not blocked); blocked symbols are managed only.
+    // one (enabled and not blocked); blocked symbols are managed only. Subtract
+    // collateral already tied up in open short puts so the cap is a true ceiling
+    // on *total* deployment, not just a per-pass budget — successive entries over
+    // time can no longer creep past `max_total_deployed`.
     let openable = active.iter().filter(|w| w.tradable != Some(0)).count().max(1);
-    let budget = (cfg.guardrails.max_total_deployed / openable as f64).max(1000.0);
+    let deployed = positions::deployed_put_collateral(broker_positions);
+    let remaining = (cfg.guardrails.max_total_deployed - deployed).max(0.0);
+    let budget = remaining / openable as f64;
 
     // `working` = symbols with a live broker order; skip them entirely this pass
     // so we never stack a second action (e.g. a fresh entry while a roll-open is
@@ -642,7 +660,7 @@ async fn gather_chain_quotes(
             *k > 0.0 && is_otm(right, *k, spot) && moneyness(right, *k, spot) <= MAX_OTM_MONEYNESS
         })
         .collect();
-    otm.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    otm.sort_by(fcmp);
     let strikes = sample_spread(&otm, MAX_CHAIN_STRIKES);
     if strikes.is_empty() {
         return Ok(None);
@@ -650,33 +668,20 @@ async fn gather_chain_quotes(
 
     // Fetch the strikes' snapshots concurrently: delayed data is slow, so a
     // serial loop would either drop quotes (short timeout) or take N × timeout.
-    let right_char = right_char(right);
+    let right_code = right.code();
     let snaps = futures::future::join_all(
         strikes
             .iter()
-            .map(|&k| ibkr.option_snapshot(symbol, &expiry_str, k, right_char)),
+            .map(|&k| ibkr.option_snapshot(symbol, &expiry_str, k, right_code)),
     )
     .await;
 
     let mut quotes: Vec<OptionQuote> = Vec::with_capacity(strikes.len());
     for (&k, snap) in strikes.iter().zip(snaps) {
         if let Ok(snap) = snap
-            && let Some(comp) = snap.comp
+            && let Some(q) = quote_from_snapshot(&snap, right, k, expiry_date)
         {
-            let price = comp.option_price.or(snap.last).unwrap_or(0.0);
-            if price > 0.0 {
-                quotes.push(OptionQuote {
-                    right,
-                    strike: k,
-                    expiry: expiry_date,
-                    bid: price,
-                    ask: price,
-                    delta: comp.delta,
-                    implied_volatility: comp.implied_volatility,
-                    open_interest: None,
-                    volume: None,
-                });
-            }
+            quotes.push(q);
         }
     }
 
@@ -703,25 +708,11 @@ async fn gather_manage_inputs(
 
     let expiry_str = short.expiry.format("%Y%m%d").to_string();
     let snap = ibkr
-        .option_snapshot(symbol, &expiry_str, short.strike, right_char(short.right))
+        .option_snapshot(symbol, &expiry_str, short.strike, short.right.code())
         .await?;
-    let comp = snap.comp.as_ref();
-    let price = comp.and_then(|c| c.option_price).or(snap.last).unwrap_or(0.0);
-    if price <= 0.0 {
+    let Some(quote) = quote_from_snapshot(&snap, short.right, short.strike, short.expiry) else {
         tracing::info!("{symbol}: open short unpriced this cycle; skipping management");
         return Ok(None);
-    }
-
-    let quote = OptionQuote {
-        right: short.right,
-        strike: short.strike,
-        expiry: short.expiry,
-        bid: price,
-        ask: price,
-        delta: comp.and_then(|c| c.delta),
-        implied_volatility: comp.and_then(|c| c.implied_volatility),
-        open_interest: None,
-        volume: None,
     };
 
     Ok(Some(SymbolInputs {
@@ -736,13 +727,6 @@ async fn gather_manage_inputs(
     }))
 }
 
-/// IBKR right code for a snapshot/order request.
-pub(super) fn right_char(right: Right) -> &'static str {
-    match right {
-        Right::Put => "P",
-        Right::Call => "C",
-    }
-}
 
 /// Whether broker `positions` still hold a *short* option matching this leg.
 /// `right` is an IBKR code (`"P"`/`"C"`); IBKR may report `right` as `PUT`/`CALL`
@@ -995,7 +979,7 @@ mod tests {
         // Merge legs → combo legs (mirrors app::combo_legs_from).
         let mut combo: Vec<ComboLeg> = Vec::new();
         for l in legs {
-            let right = if l.right == Right::Put { "P" } else { "C" };
+            let right = l.right.code();
             let action = if l.side == LegSide::Sell { Side::Sell } else { Side::Buy };
             if let Some(c) = combo.iter_mut().find(|c| (c.strike - l.strike).abs() < 1e-6 && c.right == right && c.action == action) {
                 c.ratio += 1;

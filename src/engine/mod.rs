@@ -10,6 +10,8 @@ pub mod types;
 
 pub use types::*;
 
+use math::fcmp;
+
 use chrono::NaiveDate;
 
 /// Everything needed to advise on a single symbol for one planning pass.
@@ -29,14 +31,9 @@ pub struct SymbolContext<'a> {
     pub max_collateral: f64,
 }
 
-/// Produce suggestions for one symbol based on its current wheel state.
-pub fn plan_for_symbol(ctx: &SymbolContext, cfg: &EngineConfig, today: NaiveDate) -> Vec<Suggestion> {
-    plan_for_symbol_mode(ctx, cfg, today, false)
-}
-
-/// Like [`plan_for_symbol`], but `hedged` makes the entry a defined-risk put
-/// credit spread (Hedged Wheel) instead of a cash-secured put. Management of
-/// already-open positions is identical in both modes.
+/// Produce suggestions for one symbol based on its current wheel state. `hedged`
+/// makes the entry a defined-risk put credit spread (Hedged Wheel) instead of a
+/// cash-secured put; management of already-open positions is identical in both.
 fn plan_for_symbol_mode(
     ctx: &SymbolContext,
     cfg: &EngineConfig,
@@ -124,11 +121,7 @@ fn plan_with(
     suggestions.sort_by(|a, b| {
         kind_priority(&a.kind)
             .cmp(&kind_priority(&b.kind))
-            .then(
-                b.annualized_yield
-                    .partial_cmp(&a.annualized_yield)
-                    .unwrap_or(std::cmp::Ordering::Equal),
-            )
+            .then(fcmp(&b.annualized_yield, &a.annualized_yield))
     });
 
     ActionPlan { suggestions }
@@ -165,7 +158,6 @@ mod tests {
             delta: Some(-0.30),
             implied_volatility: Some(0.3),
             open_interest: Some(500),
-            volume: Some(100),
         }];
         let ctx = SymbolContext {
             symbol: "AAPL".to_string(),
@@ -194,7 +186,6 @@ mod tests {
             delta: Some(-0.30),
             implied_volatility: Some(0.3),
             open_interest: Some(500),
-            volume: Some(100),
         }];
         let entry = SymbolContext {
             symbol: "AAPL".to_string(),
@@ -216,7 +207,6 @@ mod tests {
             delta: Some(-0.10),
             implied_volatility: Some(0.3),
             open_interest: Some(500),
-            volume: Some(100),
         };
         let manage = SymbolContext {
             symbol: "MSFT".to_string(),

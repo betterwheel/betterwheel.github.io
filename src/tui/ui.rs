@@ -73,6 +73,9 @@ fn render_tabs(frame: &mut Frame, app: &App, area: Rect) {
 fn render_status(frame: &mut Frame, app: &App, area: Rect) {
     let text = match &app.input {
         InputMode::AddSymbol(buf) => format!(" add symbol: {buf}_ "),
+        InputMode::ConfirmLive(buf) => {
+            format!(" confirm LIVE: {buf}_   (type {} then Enter, Esc cancels) ", super::app::LIVE_CONFIRM_PHRASE)
+        }
         InputMode::Normal => format!(
             " {}   ·   q quit · tab switch · j/k move · enter details · a add · d del · r refresh · ? help",
             app.status
@@ -347,10 +350,7 @@ fn render_zerodte_quadrant(frame: &mut Frame, app: &App, area: Rect, i: usize) {
                         LegSide::Sell => ("sell", Style::new().fg(Color::Yellow)),
                         LegSide::Buy => ("buy ", dim),
                     };
-                    let r = match leg.right {
-                        Right::Put => "P",
-                        Right::Call => "C",
-                    };
+                    let r = leg.right.code();
                     lines.push(Line::styled(
                         format!("  {label} {:.0}{r} @ {:.2}", leg.strike, leg.price),
                         st,
@@ -709,140 +709,7 @@ fn suggestion_detail_lines(s: &Suggestion, app: &App) -> Vec<Line<'static>> {
             ));
         }
         ActionKind::OpenStructure { kind, legs } => {
-            let sym = s.symbol.as_str();
-            let exp = s.expiry;
-            let label = kind.label();
-            let spot = s.underlying_price;
-            let max_loss = s.capital_required;
-            let when = if s.dte == 0 { "expires TODAY".to_string() } else { format!("expires in {}d", s.dte) };
-            let close_ref = if s.dte == 0 { "today's close".to_string() } else { format!("the {exp} close") };
-            let thesis = Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD);
-            let red_bold = Style::new().fg(Color::Red).add_modifier(Modifier::BOLD);
-
-            // Nearest-the-money short put / short call and the protective wings.
-            let sp = legs.iter().filter(|l| l.side == LegSide::Sell && l.right == Right::Put).map(|l| l.strike).reduce(f64::max);
-            let sc = legs.iter().filter(|l| l.side == LegSide::Sell && l.right == Right::Call).map(|l| l.strike).reduce(f64::min);
-            let lp = legs.iter().filter(|l| l.side == LegSide::Buy && l.right == Right::Put).map(|l| l.strike).reduce(f64::min);
-            let lc = legs.iter().filter(|l| l.side == LegSide::Buy && l.right == Right::Call).map(|l| l.strike).reduce(f64::max);
-            let bes = structures::breakevens(legs);
-            let be_lo = bes.first().copied();
-            let be_hi = bes.last().copied();
-
-            lines.push(Line::from(format!("OPEN {qty} {sym} {label} — {when} ({exp}).")));
-            lines.push(Line::from(""));
-
-            // Plain-English "what you're betting", then the concrete WIN / LOSE zones.
-            match kind {
-                StructureKind::IronCondor => {
-                    if let (Some(sp), Some(sc)) = (sp, sc) {
-                        lines.push(Line::styled(format!("YOU'RE BETTING {sym} (now ${spot:.0}) goes nowhere — settles between ${sp:.0} and ${sc:.0} by {close_ref}."), thesis));
-                        if let (Some(lo), Some(hi)) = (be_lo, be_hi) {
-                            lines.push(Line::styled(format!("  WIN  → keep up to ${prem:.0}: full credit anywhere ${sp:.0}–${sc:.0}, still green ${lo:.0}–${hi:.0}."), good));
-                        }
-                        if let (Some(lp), Some(lc)) = (lp, lc) {
-                            lines.push(Line::styled(format!("  LOSE → if it breaks out; loss CAPPED at ${max_loss:.0} once below ${lp:.0} or above ${lc:.0}."), warn));
-                        }
-                    }
-                }
-                StructureKind::IronFly => {
-                    if let Some(body) = sp.or(sc) {
-                        lines.push(Line::styled(format!("YOU'RE BETTING {sym} (now ${spot:.0}) PINS near ${body:.0} — a tight range — by {close_ref}."), thesis));
-                        if let (Some(lo), Some(hi)) = (be_lo, be_hi) {
-                            lines.push(Line::styled(format!("  WIN  → profitable ${lo:.0}–${hi:.0}; most of the ${prem:.0} if it lands right at ${body:.0}."), good));
-                        }
-                        if let (Some(lp), Some(lc)) = (lp, lc) {
-                            lines.push(Line::styled(format!("  LOSE → outside the breakevens; CAPPED at ${max_loss:.0} past ${lp:.0} / ${lc:.0}."), warn));
-                        }
-                    }
-                }
-                StructureKind::ShortStrangle => {
-                    if let (Some(sp), Some(sc)) = (sp, sc) {
-                        lines.push(Line::styled(format!("YOU'RE BETTING {sym} (now ${spot:.0}) stays between ${sp:.0} and ${sc:.0} by {close_ref}."), thesis));
-                        lines.push(Line::styled(format!("  WIN  → keep ${prem:.0} if it settles between the breakevens ${:.0}–${:.0}.", be_lo.unwrap_or(sp), be_hi.unwrap_or(sc)), good));
-                        lines.push(Line::styled("  LOSE → UNCAPPED past the shorts (no wings) — a big gap can be ruinous.".to_string(), red_bold));
-                    }
-                }
-                StructureKind::PutCreditSpread => {
-                    if let Some(sp) = sp {
-                        lines.push(Line::styled(format!("YOU'RE BETTING {sym} (now ${spot:.0}) STAYS ABOVE ${sp:.0} (doesn't fall much) by {close_ref}."), thesis));
-                        if let Some(lo) = be_lo {
-                            lines.push(Line::styled(format!("  WIN  → keep the full ${prem:.0} above ${sp:.0}; profitable above ${lo:.0}."), good));
-                        }
-                        if let Some(lp) = lp {
-                            lines.push(Line::styled(format!("  LOSE → if it falls below ${:.0}; CAPPED at ${max_loss:.0} once below ${lp:.0}.", be_lo.unwrap_or(sp)), warn));
-                        }
-                    }
-                }
-                StructureKind::CallCreditSpread => {
-                    if let Some(sc) = sc {
-                        lines.push(Line::styled(format!("YOU'RE BETTING {sym} (now ${spot:.0}) STAYS BELOW ${sc:.0} (doesn't rally much) by {close_ref}."), thesis));
-                        if let Some(hi) = be_hi {
-                            lines.push(Line::styled(format!("  WIN  → keep the full ${prem:.0} below ${sc:.0}; profitable below ${hi:.0}."), good));
-                        }
-                        if let Some(lc) = lc {
-                            lines.push(Line::styled(format!("  LOSE → if it rises above ${:.0}; CAPPED at ${max_loss:.0} once above ${lc:.0}.", be_hi.unwrap_or(sc)), warn));
-                        }
-                    }
-                }
-                StructureKind::BrokenWingButterfly => {
-                    lines.push(Line::styled(format!("YOU'RE BETTING {sym} (now ${spot:.0}) DOESN'T CRASH — stays up by {close_ref}. NO risk if it rises."), thesis));
-                    if let Some(lo) = be_lo {
-                        lines.push(Line::styled(format!("  WIN  → keep ${prem:.0} as long as it closes above ${lo:.0}; best near ${:.0}.", sp.unwrap_or(lo)), good));
-                    }
-                    lines.push(Line::styled(format!("  LOSE → only on a drop below breakeven; CAPPED at ${max_loss:.0}."), warn));
-                }
-            }
-            if kind.is_naked() {
-                lines.push(Line::styled("⚠ NAKED — needs a naked-options permission tier; size small.", red_bold));
-            }
-
-            // The combo legs, annotated.
-            lines.push(Line::from(""));
-            lines.push(Line::styled("The legs (sent as ONE combo order):", dim));
-            for leg in legs.iter() {
-                let side = match leg.side {
-                    LegSide::Buy => "BUY ",
-                    LegSide::Sell => "SELL",
-                };
-                let r = match leg.right {
-                    Right::Put => "P",
-                    Right::Call => "C",
-                };
-                let role = match leg.side {
-                    LegSide::Buy => " (wing — your protection)",
-                    LegSide::Sell => " (short — the bet)",
-                };
-                lines.push(Line::from(format!("  {side}  ${:.0}{r}  @ ${:.2}{role}", leg.strike, leg.price)));
-            }
-
-            // The money, in plain terms.
-            lines.push(Line::from(""));
-            lines.push(Line::from(format!("  Collect now   ${prem:.0}   (the credit — yours to keep if you win)")));
-            if kind.is_naked() {
-                lines.push(Line::from(format!("  Risk          ${max_loss:.0}   (NAKED — effectively uncapped on a gap)")));
-            } else {
-                lines.push(Line::from(format!("  Risk up to    ${max_loss:.0}   (the MOST you can lose — capped by the wings)")));
-            }
-            match bes.as_slice() {
-                [lo, .., hi] => lines.push(Line::from(format!("  Breakevens    ${lo:.0}  /  ${hi:.0}   (profit only between these)"))),
-                [be] => lines.push(Line::from(format!("  Breakeven     ${be:.0}"))),
-                [] => {}
-            }
-            if kind.pop_is_meaningful()
-                && let Some(p) = structures::estimate_pop(legs)
-            {
-                lines.push(Line::from(format!("  Est. win      ~{:.0}%   (chance it lands in the win zone)", p * 100.0)));
-            }
-
-            // Concrete "if it closes here" P&L, both directions.
-            lines.push(Line::from(""));
-            lines.extend(structure_scenarios(legs, spot, sym, shares as f64));
-
-            lines.push(Line::from(""));
-            lines.push(Line::styled(
-                "Take profit at the slot's target; for defined risk, let the wings be the stop.",
-                good,
-            ));
+            lines.extend(structure_detail_lines(s, *kind, legs));
         }
     }
 
@@ -865,6 +732,175 @@ fn suggestion_detail_lines(s: &Suggestion, app: &App) -> Vec<Line<'static>> {
         ]));
     }
     lines.push(Line::styled(format!("  {}", app.status), dim));
+    lines
+}
+
+/// The detail-panel body for a 0DTE/short-dated structure: the "what you're
+/// betting" thesis + win/lose zones, the combo legs, the money summary, and
+/// concrete close-here P&L. Split out of [`suggestion_detail_lines`] so the
+/// per-`StructureKind` rendering is one focused unit instead of a nested match.
+fn structure_detail_lines(
+    s: &Suggestion,
+    kind: StructureKind,
+    legs: &[StructureLeg],
+) -> Vec<Line<'static>> {
+    let dim = Style::new().fg(Color::DarkGray);
+    let good = Style::new().fg(Color::Green);
+    let red_bold = Style::new().fg(Color::Red).add_modifier(Modifier::BOLD);
+    let qty = s.quantity;
+    let shares = qty * 100;
+    let prem = s.premium_total;
+    let sym = s.symbol.as_str();
+    let exp = s.expiry;
+    let spot = s.underlying_price;
+    let max_loss = s.capital_required;
+    let when = if s.dte == 0 { "expires TODAY".to_string() } else { format!("expires in {}d", s.dte) };
+    let bes = structures::breakevens(legs);
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    lines.push(Line::from(format!("OPEN {qty} {sym} {} — {when} ({exp}).", kind.label())));
+    lines.push(Line::from(""));
+
+    // Plain-English "what you're betting", then the concrete WIN / LOSE zones.
+    lines.extend(structure_thesis_lines(s, kind, legs));
+    if kind.is_naked() {
+        lines.push(Line::styled("⚠ NAKED — needs a naked-options permission tier; size small.", red_bold));
+    }
+
+    // The combo legs, annotated.
+    lines.push(Line::from(""));
+    lines.push(Line::styled("The legs (sent as ONE combo order):", dim));
+    for leg in legs.iter() {
+        let side = match leg.side {
+            LegSide::Buy => "BUY ",
+            LegSide::Sell => "SELL",
+        };
+        let r = leg.right.code();
+        let role = match leg.side {
+            LegSide::Buy => " (wing — your protection)",
+            LegSide::Sell => " (short — the bet)",
+        };
+        lines.push(Line::from(format!("  {side}  ${:.0}{r}  @ ${:.2}{role}", leg.strike, leg.price)));
+    }
+
+    // The money, in plain terms.
+    lines.push(Line::from(""));
+    lines.push(Line::from(format!("  Collect now   ${prem:.0}   (the credit — yours to keep if you win)")));
+    if kind.is_naked() {
+        lines.push(Line::from(format!("  Risk          ${max_loss:.0}   (NAKED — effectively uncapped on a gap)")));
+    } else {
+        lines.push(Line::from(format!("  Risk up to    ${max_loss:.0}   (the MOST you can lose — capped by the wings)")));
+    }
+    match bes.as_slice() {
+        [lo, .., hi] => lines.push(Line::from(format!("  Breakevens    ${lo:.0}  /  ${hi:.0}   (profit only between these)"))),
+        [be] => lines.push(Line::from(format!("  Breakeven     ${be:.0}"))),
+        [] => {}
+    }
+    if kind.pop_is_meaningful()
+        && let Some(p) = structures::estimate_pop(legs)
+    {
+        lines.push(Line::from(format!("  Est. win      ~{:.0}%   (chance it lands in the win zone)", p * 100.0)));
+    }
+
+    // Concrete "if it closes here" P&L, both directions.
+    lines.push(Line::from(""));
+    lines.extend(structure_scenarios(legs, spot, sym, shares as f64));
+
+    lines.push(Line::from(""));
+    lines.push(Line::styled(
+        "Take profit at the slot's target; for defined risk, let the wings be the stop.",
+        good,
+    ));
+    lines
+}
+
+/// The per-`StructureKind` "you're betting…" thesis and WIN/LOSE zone lines —
+/// the one place that knows each structure's shape in plain English.
+fn structure_thesis_lines(
+    s: &Suggestion,
+    kind: StructureKind,
+    legs: &[StructureLeg],
+) -> Vec<Line<'static>> {
+    let good = Style::new().fg(Color::Green);
+    let warn = Style::new().fg(Color::Yellow);
+    let thesis = Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+    let red_bold = Style::new().fg(Color::Red).add_modifier(Modifier::BOLD);
+    let sym = s.symbol.as_str();
+    let spot = s.underlying_price;
+    let prem = s.premium_total;
+    let max_loss = s.capital_required;
+    let close_ref = if s.dte == 0 { "today's close".to_string() } else { format!("the {} close", s.expiry) };
+
+    // Nearest-the-money short put / short call and the protective wings.
+    let sp = legs.iter().filter(|l| l.side == LegSide::Sell && l.right == Right::Put).map(|l| l.strike).reduce(f64::max);
+    let sc = legs.iter().filter(|l| l.side == LegSide::Sell && l.right == Right::Call).map(|l| l.strike).reduce(f64::min);
+    let lp = legs.iter().filter(|l| l.side == LegSide::Buy && l.right == Right::Put).map(|l| l.strike).reduce(f64::min);
+    let lc = legs.iter().filter(|l| l.side == LegSide::Buy && l.right == Right::Call).map(|l| l.strike).reduce(f64::max);
+    let bes = structures::breakevens(legs);
+    let be_lo = bes.first().copied();
+    let be_hi = bes.last().copied();
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    match kind {
+        StructureKind::IronCondor => {
+            if let (Some(sp), Some(sc)) = (sp, sc) {
+                lines.push(Line::styled(format!("YOU'RE BETTING {sym} (now ${spot:.0}) goes nowhere — settles between ${sp:.0} and ${sc:.0} by {close_ref}."), thesis));
+                if let (Some(lo), Some(hi)) = (be_lo, be_hi) {
+                    lines.push(Line::styled(format!("  WIN  → keep up to ${prem:.0}: full credit anywhere ${sp:.0}–${sc:.0}, still green ${lo:.0}–${hi:.0}."), good));
+                }
+                if let (Some(lp), Some(lc)) = (lp, lc) {
+                    lines.push(Line::styled(format!("  LOSE → if it breaks out; loss CAPPED at ${max_loss:.0} once below ${lp:.0} or above ${lc:.0}."), warn));
+                }
+            }
+        }
+        StructureKind::IronFly => {
+            if let Some(body) = sp.or(sc) {
+                lines.push(Line::styled(format!("YOU'RE BETTING {sym} (now ${spot:.0}) PINS near ${body:.0} — a tight range — by {close_ref}."), thesis));
+                if let (Some(lo), Some(hi)) = (be_lo, be_hi) {
+                    lines.push(Line::styled(format!("  WIN  → profitable ${lo:.0}–${hi:.0}; most of the ${prem:.0} if it lands right at ${body:.0}."), good));
+                }
+                if let (Some(lp), Some(lc)) = (lp, lc) {
+                    lines.push(Line::styled(format!("  LOSE → outside the breakevens; CAPPED at ${max_loss:.0} past ${lp:.0} / ${lc:.0}."), warn));
+                }
+            }
+        }
+        StructureKind::ShortStrangle => {
+            if let (Some(sp), Some(sc)) = (sp, sc) {
+                lines.push(Line::styled(format!("YOU'RE BETTING {sym} (now ${spot:.0}) stays between ${sp:.0} and ${sc:.0} by {close_ref}."), thesis));
+                lines.push(Line::styled(format!("  WIN  → keep ${prem:.0} if it settles between the breakevens ${:.0}–${:.0}.", be_lo.unwrap_or(sp), be_hi.unwrap_or(sc)), good));
+                lines.push(Line::styled("  LOSE → UNCAPPED past the shorts (no wings) — a big gap can be ruinous.".to_string(), red_bold));
+            }
+        }
+        StructureKind::PutCreditSpread => {
+            if let Some(sp) = sp {
+                lines.push(Line::styled(format!("YOU'RE BETTING {sym} (now ${spot:.0}) STAYS ABOVE ${sp:.0} (doesn't fall much) by {close_ref}."), thesis));
+                if let Some(lo) = be_lo {
+                    lines.push(Line::styled(format!("  WIN  → keep the full ${prem:.0} above ${sp:.0}; profitable above ${lo:.0}."), good));
+                }
+                if let Some(lp) = lp {
+                    lines.push(Line::styled(format!("  LOSE → if it falls below ${:.0}; CAPPED at ${max_loss:.0} once below ${lp:.0}.", be_lo.unwrap_or(sp)), warn));
+                }
+            }
+        }
+        StructureKind::CallCreditSpread => {
+            if let Some(sc) = sc {
+                lines.push(Line::styled(format!("YOU'RE BETTING {sym} (now ${spot:.0}) STAYS BELOW ${sc:.0} (doesn't rally much) by {close_ref}."), thesis));
+                if let Some(hi) = be_hi {
+                    lines.push(Line::styled(format!("  WIN  → keep the full ${prem:.0} below ${sc:.0}; profitable below ${hi:.0}."), good));
+                }
+                if let Some(lc) = lc {
+                    lines.push(Line::styled(format!("  LOSE → if it rises above ${:.0}; CAPPED at ${max_loss:.0} once above ${lc:.0}.", be_hi.unwrap_or(sc)), warn));
+                }
+            }
+        }
+        StructureKind::BrokenWingButterfly => {
+            lines.push(Line::styled(format!("YOU'RE BETTING {sym} (now ${spot:.0}) DOESN'T CRASH — stays up by {close_ref}. NO risk if it rises."), thesis));
+            if let Some(lo) = be_lo {
+                lines.push(Line::styled(format!("  WIN  → keep ${prem:.0} as long as it closes above ${lo:.0}; best near ${:.0}.", sp.unwrap_or(lo)), good));
+            }
+            lines.push(Line::styled(format!("  LOSE → only on a drop below breakeven; CAPPED at ${max_loss:.0}."), warn));
+        }
+    }
     lines
 }
 
@@ -1009,7 +1045,7 @@ fn render_settings(frame: &mut Frame, app: &App, area: Rect) {
 fn suggestion_cells(s: &Suggestion) -> Vec<String> {
     vec![
         s.symbol.clone(),
-        action_label(&s.kind).to_string(),
+        s.kind.display_label().to_string(),
         format!("{:.1}", s.strike),
         s.expiry.format("%Y-%m-%d").to_string(),
         s.dte.to_string(),
@@ -1022,17 +1058,6 @@ fn suggestion_cells(s: &Suggestion) -> Vec<String> {
             "—".into()
         },
     ]
-}
-
-fn action_label(k: &ActionKind) -> &'static str {
-    match k {
-        ActionKind::SellPut => "Sell Put",
-        ActionKind::SellCall => "Sell Call",
-        ActionKind::CloseForProfit => "Close",
-        ActionKind::Roll { .. } => "Roll",
-        ActionKind::SellPutSpread { .. } => "Put Spread",
-        ActionKind::OpenStructure { kind, .. } => kind.label(),
-    }
 }
 
 fn styled_row<'a>(cells: Vec<String>, selected: bool) -> Row<'a> {

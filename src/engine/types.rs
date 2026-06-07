@@ -13,6 +13,30 @@ pub enum Right {
     Call,
 }
 
+impl Right {
+    /// The single-letter IBKR/wire code for this right (`"P"` / `"C"`). The one
+    /// source of truth for the P/C strings that flow into combo legs, order
+    /// requests, journal rows, and the leg-encoding blob.
+    pub fn code(self) -> &'static str {
+        match self {
+            Right::Put => "P",
+            Right::Call => "C",
+        }
+    }
+
+    /// Parse an IBKR right code. IBKR emits several spellings (`P`/`PUT`,
+    /// `C`/`CALL`); anything whose first letter is `C` is a call, everything else
+    /// (including our own `"P"`) is a put — matching the historical "non-`C` means
+    /// put" convention used at the encode/decode and roll sites.
+    pub fn from_code(s: &str) -> Right {
+        if s.starts_with('C') || s.starts_with('c') {
+            Right::Call
+        } else {
+            Right::Put
+        }
+    }
+}
+
 /// A single option contract's market snapshot, as the engine needs it.
 #[derive(Debug, Clone)]
 pub struct OptionQuote {
@@ -27,7 +51,6 @@ pub struct OptionQuote {
     pub delta: Option<f64>,
     pub implied_volatility: Option<f64>,
     pub open_interest: Option<i64>,
-    pub volume: Option<i64>,
 }
 
 impl OptionQuote {
@@ -209,6 +232,35 @@ pub enum ActionKind {
     OpenStructure { kind: StructureKind, legs: Vec<StructureLeg> },
 }
 
+impl ActionKind {
+    /// Stable identifier for the journal `action` column (persisted, parsed). Kept
+    /// next to [`Self::display_label`] so adding a variant forces both to be
+    /// handled rather than silently diverging.
+    pub fn persist_key(&self) -> String {
+        match self {
+            ActionKind::SellPut => "SellPut".into(),
+            ActionKind::SellCall => "SellCall".into(),
+            ActionKind::CloseForProfit => "Close".into(),
+            ActionKind::Roll { .. } => "Roll".into(),
+            ActionKind::SellPutSpread { .. } => "SellPutSpread".into(),
+            ActionKind::OpenStructure { kind, .. } => kind.label().into(),
+        }
+    }
+
+    /// Human-readable label for tables and headers (distinct from the persisted
+    /// [`Self::persist_key`]).
+    pub fn display_label(&self) -> &'static str {
+        match self {
+            ActionKind::SellPut => "Sell Put",
+            ActionKind::SellCall => "Sell Call",
+            ActionKind::CloseForProfit => "Close",
+            ActionKind::Roll { .. } => "Roll",
+            ActionKind::SellPutSpread { .. } => "Put Spread",
+            ActionKind::OpenStructure { kind, .. } => kind.label(),
+        }
+    }
+}
+
 /// A single recommended action with everything needed to preview/execute it.
 #[derive(Debug, Clone)]
 pub struct Suggestion {
@@ -326,7 +378,7 @@ mod tests {
             right: Right::Put, strike: 100.0,
             expiry: NaiveDate::from_ymd_opt(2026, 6, 19).unwrap(),
             bid: 1.0, ask: 1.4, delta: Some(-0.3), implied_volatility: Some(0.3),
-            open_interest: None, volume: None,
+            open_interest: None,
         };
         assert!((q.mid() - 1.2).abs() < 1e-9);
         // Missing ask → fall back to bid, not a bogus midpoint.

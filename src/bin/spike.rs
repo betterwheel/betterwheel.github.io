@@ -13,6 +13,7 @@ use chrono::{Local, NaiveDate};
 use std::path::Path;
 
 use thewheel::config::Config;
+use thewheel::engine::math::fcmp;
 use thewheel::ibkr::{Ibkr, Tradability};
 
 #[tokio::main]
@@ -159,7 +160,7 @@ fn median(xs: &[f64]) -> f64 {
         return 0.0;
     }
     let mut v = xs.to_vec();
-    v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    v.sort_by(fcmp);
     v[v.len() / 2]
 }
 
@@ -179,7 +180,7 @@ fn pick_expiry(expirations: &[String], today: NaiveDate) -> Option<(String, i64)
 /// Up to `n` OTM put strikes nearest to (and below) spot, deepest-OTM last.
 fn otm_put_strikes(strikes: &[f64], spot: f64, n: usize) -> Vec<f64> {
     let mut below: Vec<f64> = strikes.iter().copied().filter(|k| *k < spot).collect();
-    below.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    below.sort_by(fcmp);
     // Closest-to-spot first, then take n, then reverse so deepest-OTM is last.
     let mut picked: Vec<f64> = below.into_iter().rev().take(n).collect();
     picked.reverse();

@@ -6,11 +6,51 @@
 
 use chrono::NaiveDate;
 
-use super::types::{OptionQuote, Right};
+use super::types::{EngineConfig, OptionQuote, Right};
+
+/// Shared entry gates for a short-option candidate: the DTE band, premium floor,
+/// open-interest floor, and the delta band (resolving the greek with a
+/// Black-Scholes fallback). Returns the resolved **absolute delta** when every
+/// gate passes, or `None` to skip the quote. The moneyness gate (strike vs spot
+/// for a CSP/spread, strike vs cost basis for a covered call) is selector-specific
+/// and stays with the caller. Single source of truth for the CSP, put-spread, and
+/// covered-call filters so a tuning change can't silently diverge between them.
+pub fn passes_short_gates(q: &OptionQuote, spot: f64, d: i64, cfg: &EngineConfig) -> Option<f64> {
+    if d < cfg.min_dte || d > cfg.max_dte {
+        return None;
+    }
+    if q.mid() < cfg.min_premium {
+        return None;
+    }
+    if let Some(oi) = q.open_interest
+        && oi < cfg.min_open_interest
+    {
+        return None;
+    }
+    let abs_delta = resolve_abs_delta(q, spot, d, cfg.risk_free_rate)?;
+    if abs_delta < cfg.min_delta || abs_delta > cfg.max_delta {
+        return None;
+    }
+    Some(abs_delta)
+}
+
+/// The shared entry tie-break score: maximize annualized yield, then prefer the
+/// strike whose absolute delta sits nearest the configured target.
+pub fn entry_score(ann: f64, abs_delta: f64, cfg: &EngineConfig) -> f64 {
+    ann - 0.001 * (abs_delta - cfg.target_delta).abs()
+}
 
 /// Calendar days to expiration. Negative once expiry has passed.
 pub fn dte(today: NaiveDate, expiry: NaiveDate) -> i64 {
     (expiry - today).num_days()
+}
+
+/// NaN-safe ascending comparison for `f64`s — the total order to feed `sort_by` /
+/// `min_by` / `max_by` (incomparable NaN sorts as `Equal`). Replaces the
+/// `a.partial_cmp(b).unwrap_or(Ordering::Equal)` idiom repeated across the engine,
+/// live-data, and broker layers.
+pub fn fcmp(a: &f64, b: &f64) -> std::cmp::Ordering {
+    a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
 }
 
 /// Annualized return on collateral, as a fraction (0.30 == 30%/yr).

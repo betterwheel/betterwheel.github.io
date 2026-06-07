@@ -9,6 +9,7 @@ use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 
 use super::models::{
     JournalRow, NewJournalEntry, PendingRollRow, WatchlistRow, WheelPositionRow, ZeroDtePositionRow,
+    journal_status,
 };
 
 /// Handle to the local database. Cheap to clone (shares the pool).
@@ -25,7 +26,12 @@ impl Store {
         }
         let opts = SqliteConnectOptions::new()
             .filename(path)
-            .create_if_missing(true);
+            .create_if_missing(true)
+            // Enforce the FK declarations the schema carries (SQLite defaults FKs
+            // OFF), and wait rather than erroring if a connection is momentarily
+            // busy (the order-event stream and the UI both write).
+            .foreign_keys(true)
+            .busy_timeout(std::time::Duration::from_secs(5));
         let pool = SqlitePoolOptions::new()
             .max_connections(5)
             .connect_with(opts)
@@ -38,7 +44,10 @@ impl Store {
 
     /// An ephemeral in-memory database (for tests).
     pub async fn open_in_memory() -> Result<Self> {
-        let opts = SqliteConnectOptions::from_str("sqlite::memory:")?;
+        let opts = SqliteConnectOptions::from_str("sqlite::memory:")?
+            // Match the on-disk connection so tests exercise the same constraints.
+            .foreign_keys(true)
+            .busy_timeout(std::time::Duration::from_secs(5));
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect_with(opts)
@@ -263,7 +272,8 @@ impl Store {
     /// still working (which could double exposure).
     pub async fn symbols_with_working_orders(&self) -> Result<Vec<String>> {
         let rows: Vec<(String,)> =
-            sqlx::query_as("SELECT DISTINCT symbol FROM journal WHERE status = 'submitted'")
+            sqlx::query_as("SELECT DISTINCT symbol FROM journal WHERE status = ?1")
+                .bind(journal_status::SUBMITTED)
                 .fetch_all(&self.pool)
                 .await?;
         Ok(rows.into_iter().map(|(s,)| s).collect())

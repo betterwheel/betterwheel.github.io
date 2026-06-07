@@ -21,8 +21,7 @@ use tokio::sync::mpsc;
 use super::demo;
 use super::schedule;
 use super::live::{
-    gather, live_suggestions, position_has_short, price_leg, probe_unknown_tradability,
-    resolve_roll_target, right_char, structure_suggestions, sync_wheel_state, LiveData,
+    gather, position_has_short, price_leg, resolve_roll_target, LiveData,
 };
 use crate::config::{Config, TradingMode, UserSettings, ZeroDteSettings};
 use crate::engine::types::{
@@ -30,11 +29,12 @@ use crate::engine::types::{
 };
 use crate::ibkr::{
     AccountSnapshot, ComboLeg, ComboOrder, Ibkr, OpenOrderInfo, OptionOrder, OrderEvent,
-    OrderOutcome, PositionRow, Side, SpreadOrder,
+    OrderOutcome, OrderState, PositionRow, Side, SpreadOrder,
 };
+use crate::positions;
 use crate::store::{
     JournalRow, NewJournalEntry, PendingRollRow, Store, WatchlistRow, WheelPositionRow,
-    ZeroDtePositionRow,
+    ZeroDtePositionRow, journal_status, zerodte_status,
 };
 
 
@@ -81,11 +81,18 @@ impl Tab {
     }
 }
 
+/// The exact phrase the user must type to unlock live-order transmits for the
+/// session when `guardrails.require_live_confirmation` is on and the connection is
+/// live. Deliberate friction before any real-money order — see [`App::live_gate_ok`].
+pub(super) const LIVE_CONFIRM_PHRASE: &str = "LIVE";
+
 /// Keyboard input mode.
 pub enum InputMode {
     Normal,
     /// Typing a symbol to add to the watchlist (holds the buffer).
     AddSymbol(String),
+    /// Typing the [`LIVE_CONFIRM_PHRASE`] to unlock live trading this session.
+    ConfirmLive(String),
 }
 
 /// An intent produced by a keypress, applied by [`App::dispatch`].
@@ -97,6 +104,8 @@ pub enum Action {
     Up,
     Down,
     StartAddSymbol,
+    /// Begin typing the live-trading confirmation phrase (`L`, live mode only).
+    StartLiveConfirm,
     InputChar(char),
     Backspace,
     CancelInput,
@@ -160,6 +169,10 @@ pub struct App {
     pub connected: bool,
     /// When `true`, `Execute` will actually transmit. Toggled with `A`.
     pub armed: bool,
+    /// Whether the user has typed the live-trading confirmation phrase this
+    /// session (see [`App::live_gate_ok`]). Only consulted in live mode with
+    /// `require_live_confirmation` on; resets every launch by design.
+    pub live_confirmed: bool,
     /// Rolls whose close leg is live but not yet filled; the open leg is sent
     /// only once the matching close fills (see [`App::apply_order_event`]).
     pending_rolls: Vec<PendingRoll>,
@@ -212,8 +225,8 @@ impl PendingRoll {
     fn from_row(r: PendingRollRow) -> Self {
         Self {
             symbol: r.symbol,
-            // Map the persisted right back to a static literal.
-            right: if r.right == "C" { "C" } else { "P" },
+            // Map the persisted right back to a static literal (non-`C` ⇒ put).
+            right: Right::from_code(&r.right).code(),
             near_strike: r.near_strike,
             near_expiry: r.near_expiry,
             to_strike: r.to_strike,
@@ -279,6 +292,7 @@ impl App {
             status: initial_status(connected),
             connected,
             armed: false,
+            live_confirmed: false,
             pending_rolls: Vec::new(),
             update_tx: None,
             reloading: false,
@@ -324,6 +338,16 @@ impl App {
             .count()
     }
 
+    /// Whether live-order transmits are permitted right now with respect to the
+    /// live-confirmation guardrail. Paper mode, or a disabled guardrail, is always
+    /// allowed; live mode with `require_live_confirmation` on requires the user to
+    /// have typed [`LIVE_CONFIRM_PHRASE`] this session (via `L`).
+    pub fn live_gate_ok(&self) -> bool {
+        !self.cfg.connection.is_live()
+            || !self.cfg.guardrails.require_live_confirmation
+            || self.live_confirmed
+    }
+
     fn list_len(&self) -> usize {
         match self.tab {
             Tab::Watchlist => self.watchlist.len(),
@@ -351,7 +375,7 @@ impl App {
 
     /// Map a keypress to an [`Action`] (mode-aware).
     pub fn handle_key(&self, key: KeyEvent) -> Option<Action> {
-        if let InputMode::AddSymbol(_) = self.input {
+        if matches!(self.input, InputMode::AddSymbol(_) | InputMode::ConfirmLive(_)) {
             return match key.code {
                 KeyCode::Enter => Some(Action::SubmitInput),
                 KeyCode::Esc => Some(Action::CancelInput),
@@ -406,6 +430,7 @@ impl App {
             KeyCode::Char('j') | KeyCode::Down => Some(Action::Down),
             KeyCode::Char('k') | KeyCode::Up => Some(Action::Up),
             KeyCode::Char('a') => Some(Action::StartAddSymbol),
+            KeyCode::Char('L') => Some(Action::StartLiveConfirm),
             KeyCode::Char('d') => Some(Action::DeleteSelected),
             KeyCode::Char('r') => Some(Action::Refresh),
             KeyCode::Char('?') => Some(Action::JumpTab(Tab::Help.index())),
@@ -446,33 +471,61 @@ impl App {
                 self.input = InputMode::AddSymbol(String::new());
                 self.status = "add symbol — type a ticker, Enter to confirm, Esc to cancel".into();
             }
-            Action::InputChar(c) => {
-                if let InputMode::AddSymbol(buf) = &mut self.input
-                    && (c.is_ascii_alphanumeric() || c == '.')
-                {
+            Action::StartLiveConfirm => {
+                if !self.cfg.connection.is_live() {
+                    self.status = "live confirmation only applies in live mode".into();
+                } else if self.live_confirmed {
+                    self.status = "LIVE trading already confirmed this session".into();
+                } else {
+                    self.input = InputMode::ConfirmLive(String::new());
+                    self.status = format!(
+                        "type {LIVE_CONFIRM_PHRASE} then Enter to unlock LIVE trading (Esc cancels)"
+                    );
+                }
+            }
+            Action::InputChar(c) => match &mut self.input {
+                InputMode::AddSymbol(buf) if c.is_ascii_alphanumeric() || c == '.' => {
                     buf.push(c.to_ascii_uppercase());
                 }
-            }
-            Action::Backspace => {
-                if let InputMode::AddSymbol(buf) = &mut self.input {
+                InputMode::ConfirmLive(buf) if c.is_ascii_alphanumeric() => {
+                    buf.push(c.to_ascii_uppercase());
+                }
+                _ => {}
+            },
+            Action::Backspace => match &mut self.input {
+                InputMode::AddSymbol(buf) | InputMode::ConfirmLive(buf) => {
                     buf.pop();
                 }
-            }
+                InputMode::Normal => {}
+            },
             Action::CancelInput => {
                 self.input = InputMode::Normal;
                 self.status = self.default_status();
             }
             Action::SubmitInput => {
-                if let InputMode::AddSymbol(buf) = &self.input {
-                    let sym = buf.trim().to_string();
-                    if !sym.is_empty() {
-                        store.add_symbol(&sym, "STK").await?;
-                        self.status = format!("added {sym}");
+                // Take the buffer (and reset to Normal) so each branch owns its text.
+                match std::mem::replace(&mut self.input, InputMode::Normal) {
+                    InputMode::AddSymbol(buf) => {
+                        let sym = buf.trim().to_string();
+                        if !sym.is_empty() {
+                            store.add_symbol(&sym, "STK").await?;
+                            self.status = format!("added {sym}");
+                        }
+                        self.refresh_watchlist(store).await?;
+                        self.request_reload(store).await;
                     }
+                    InputMode::ConfirmLive(buf) => {
+                        if buf.trim() == LIVE_CONFIRM_PHRASE {
+                            self.live_confirmed = true;
+                            self.status = "✓ LIVE trading confirmed for this session".into();
+                        } else {
+                            self.status = format!(
+                                "phrase mismatch — LIVE trading still locked (type {LIVE_CONFIRM_PHRASE})"
+                            );
+                        }
+                    }
+                    InputMode::Normal => {}
                 }
-                self.input = InputMode::Normal;
-                self.refresh_watchlist(store).await?;
-                self.request_reload(store).await;
             }
             Action::DeleteSelected => {
                 if self.tab == Tab::Watchlist
@@ -632,87 +685,16 @@ impl App {
     }
 
     /// Submit a what-if for the selected suggestion; journal it; show the result.
+    /// Preview transmits nothing, so it needs no guardrails — it routes straight
+    /// to the shared dispatch.
     async fn preview_suggestion(&mut self, sug: &Suggestion, store: &Store) -> Result<()> {
-        let Some(ibkr) = self.ibkr.clone() else {
-            self.status = "not connected — start IB Gateway first".into();
-            return Ok(());
-        };
-        if let ActionKind::Roll { to_expiry, to_strike } = sug.kind {
-            return self.preview_roll(&ibkr, sug, to_expiry, to_strike, store).await;
-        }
-        if let ActionKind::SellPutSpread { long_strike, .. } = sug.kind {
-            return self.preview_or_execute_spread(&ibkr, sug, long_strike, true, store).await;
-        }
-        if let ActionKind::OpenStructure { kind, legs } = &sug.kind {
-            return self
-                .preview_or_execute_structure(&ibkr, sug, *kind, &legs.clone(), true, store)
-                .await;
-        }
-        let Some((side, right_str)) = side_and_right(sug) else {
-            self.status = "this action can't be previewed".into();
-            return Ok(());
-        };
-        let expiry = sug.expiry.format("%Y%m%d").to_string();
-        let order = OptionOrder {
-            symbol: &sug.symbol,
-            expiry_yyyymmdd: &expiry,
-            strike: sug.strike,
-            right: right_str,
-            side,
-            quantity: sug.quantity,
-            limit: sug.limit_price,
-        };
-        let result = ibkr.submit_or_preview(&order, true).await;
-        let entry_base = journal_entry_for(sug, &expiry, right_str);
-        match result {
-            Ok(OrderOutcome::Preview(state)) => {
-                let margin = state
-                    .initial_margin_after
-                    .map(|v| format!("${v:.0}"))
-                    .unwrap_or_else(|| "?".into());
-                let commission = state
-                    .commission
-                    .map(|v| format!("${v:.2}"))
-                    .unwrap_or_else(|| "?".into());
-                self.status = format!(
-                    "preview {} {} {:.1}{}@{:.2}: margin {} · commission {} · {}",
-                    sug.symbol,
-                    format_kind(&sug.kind),
-                    sug.strike,
-                    right_str,
-                    sug.limit_price,
-                    margin,
-                    commission,
-                    state.status
-                );
-                store
-                    .record(&NewJournalEntry {
-                        status: "previewed".into(),
-                        premium: Some(sug.premium_total),
-                        ..entry_base
-                    })
-                    .await?;
-            }
-            Ok(OrderOutcome::Submitted(_)) => {
-                self.status = "preview unexpectedly returned a submission id".into();
-            }
-            Err(e) => {
-                self.status = format!("preview error: {e}");
-                store
-                    .record(&NewJournalEntry {
-                        status: "rejected".into(),
-                        note: Some(e.to_string()),
-                        ..entry_base
-                    })
-                    .await?;
-            }
-        }
-        self.journal = store.recent_journal(200).await?;
-        Ok(())
+        self.route_order(sug, true, store).await
     }
 
-    /// Transmit the selected suggestion (live order). Gated on armed +
-    /// connected + not read_only; auto-disarms after a successful submission.
+    /// Transmit the selected suggestion (live order). Enforces the full guardrail
+    /// stack — armed, not read_only, within the contract cap, live-confirmed, and
+    /// under the aggregate deployment cap — then hands off to the shared dispatch.
+    /// A successful single-leg submit auto-disarms.
     async fn execute_suggestion(&mut self, sug: &Suggestion, store: &Store) -> Result<()> {
         if !self.armed {
             self.status = "disarmed — press `A` to arm before executing".into();
@@ -729,23 +711,76 @@ impl App {
             );
             return Ok(());
         }
+        if !self.live_gate_ok() {
+            self.status = format!(
+                "LIVE not confirmed — press `L` and type {LIVE_CONFIRM_PHRASE} to unlock real-money orders this session"
+            );
+            return Ok(());
+        }
+        // Aggregate deployment cap: a new collateral-deploying entry must not push
+        // total CSP collateral over `max_total_deployed`. The per-pass sizing budget
+        // splits the cap across the watchlist but doesn't see collateral already
+        // tied up by prior entries; this is the hard backstop that does.
+        if matches!(sug.kind, ActionKind::SellPut | ActionKind::SellPutSpread { .. }) {
+            let deployed = positions::deployed_put_collateral(&self.broker_positions);
+            // Full short-strike notional, the same basis both Classic and Hedged
+            // entries are sized against (a spread's `capital_required` is only its
+            // width, so it can't be used here).
+            let new_notional = sug.strike * 100.0 * sug.quantity as f64;
+            if deployed + new_notional > self.cfg.guardrails.max_total_deployed {
+                self.status = format!(
+                    "blocked: total CSP collateral ${:.0} would exceed max_total_deployed ${:.0} (${:.0} already deployed)",
+                    deployed + new_notional, self.cfg.guardrails.max_total_deployed, deployed
+                );
+                return Ok(());
+            }
+        }
+        self.route_order(sug, false, store).await
+    }
+
+    /// Single dispatch from a suggestion to its order path, shared by preview and
+    /// execute so the two can never diverge on which `ActionKind`s they handle (a
+    /// new variant handled in one but not the other would be a real bug). `preview`
+    /// selects what-if vs transmit; the execute caller has already enforced the
+    /// guardrails before reaching here.
+    async fn route_order(&mut self, sug: &Suggestion, preview: bool, store: &Store) -> Result<()> {
         let Some(ibkr) = self.ibkr.clone() else {
             self.status = "not connected — start IB Gateway first".into();
             return Ok(());
         };
-        if let ActionKind::Roll { to_expiry, to_strike } = sug.kind {
-            return self.execute_roll(&ibkr, sug, to_expiry, to_strike, store).await;
+        match sug.kind {
+            ActionKind::Roll { to_expiry, to_strike } => {
+                if preview {
+                    self.preview_roll(&ibkr, sug, to_expiry, to_strike, store).await
+                } else {
+                    self.execute_roll(&ibkr, sug, to_expiry, to_strike, store).await
+                }
+            }
+            ActionKind::SellPutSpread { long_strike, .. } => {
+                self.preview_or_execute_spread(&ibkr, sug, long_strike, preview, store).await
+            }
+            ActionKind::OpenStructure { ref kind, ref legs } => {
+                let (kind, legs) = (*kind, legs.clone());
+                self.preview_or_execute_structure(&ibkr, sug, kind, &legs, preview, store).await
+            }
+            _ => self.preview_or_execute_single(&ibkr, sug, preview, store).await,
         }
-        if let ActionKind::SellPutSpread { long_strike, .. } = sug.kind {
-            return self.preview_or_execute_spread(&ibkr, sug, long_strike, false, store).await;
-        }
-        if let ActionKind::OpenStructure { kind, legs } = &sug.kind {
-            return self
-                .preview_or_execute_structure(&ibkr, sug, *kind, &legs.clone(), false, store)
-                .await;
-        }
+    }
+
+    /// Preview or transmit a single-leg option order (CSP / covered call / buy-to-
+    /// close), journaling the outcome. Merged preview/execute tail: `submit_or_preview`
+    /// returns `Preview` exactly when `preview` is true and `Submitted` when false,
+    /// so the two outcome arms line up with the two modes. A live submit auto-disarms.
+    async fn preview_or_execute_single(
+        &mut self,
+        ibkr: &Ibkr,
+        sug: &Suggestion,
+        preview: bool,
+        store: &Store,
+    ) -> Result<()> {
         let Some((side, right_str)) = side_and_right(sug) else {
-            self.status = "this action can't be executed".into();
+            self.status =
+                format!("this action can't be {}", if preview { "previewed" } else { "executed" });
             return Ok(());
         };
         let expiry = sug.expiry.format("%Y%m%d").to_string();
@@ -758,17 +793,32 @@ impl App {
             quantity: sug.quantity,
             limit: sug.limit_price,
         };
-        let result = ibkr.submit_or_preview(&order, false).await;
+        let result = ibkr.submit_or_preview(&order, preview).await;
         let entry_base = journal_entry_for(sug, &expiry, right_str);
         match result {
-            Ok(OrderOutcome::Submitted(oid)) => {
+            Ok(OrderOutcome::Preview(state)) => {
+                let (margin, commission) = preview_margin_commission(&state);
                 self.status = format!(
-                    "submitted {} {} {:.1}{}@{:.2} → id {}",
-                    sug.symbol, format_kind(&sug.kind), sug.strike, right_str, sug.limit_price, oid
+                    "preview {} {} {:.1}{}@{:.2}: margin {} · commission {} · {}",
+                    sug.symbol, sug.kind.persist_key(), sug.strike, right_str, sug.limit_price,
+                    margin, commission, state.status
                 );
                 store
                     .record(&NewJournalEntry {
-                        status: "submitted".into(),
+                        status: journal_status::PREVIEWED.into(),
+                        premium: Some(sug.premium_total),
+                        ..entry_base
+                    })
+                    .await?;
+            }
+            Ok(OrderOutcome::Submitted(oid)) => {
+                self.status = format!(
+                    "submitted {} {} {:.1}{}@{:.2} → id {}",
+                    sug.symbol, sug.kind.persist_key(), sug.strike, right_str, sug.limit_price, oid
+                );
+                store
+                    .record(&NewJournalEntry {
+                        status: journal_status::SUBMITTED.into(),
                         ibkr_order_id: Some(oid),
                         premium: Some(sug.premium_total),
                         ..entry_base
@@ -777,14 +827,12 @@ impl App {
                 // Safety: a successful transmit auto-disarms.
                 self.armed = false;
             }
-            Ok(OrderOutcome::Preview(_)) => {
-                self.status = "execute unexpectedly returned a preview".into();
-            }
             Err(e) => {
-                self.status = format!("execute error: {e}");
+                self.status =
+                    format!("{} error: {e}", if preview { "preview" } else { "execute" });
                 store
                     .record(&NewJournalEntry {
-                        status: "rejected".into(),
+                        status: journal_status::REJECTED.into(),
                         note: Some(e.to_string()),
                         ..entry_base
                     })
@@ -825,14 +873,7 @@ impl App {
         let entry_base = NewJournalEntry { note: Some(note), ..journal_entry_for(sug, &expiry, "P") };
         match ibkr.submit_or_preview_spread(&order, preview).await {
             Ok(OrderOutcome::Preview(state)) => {
-                let margin = state
-                    .initial_margin_after
-                    .map(|v| format!("${v:.0}"))
-                    .unwrap_or_else(|| "?".into());
-                let commission = state
-                    .commission
-                    .map(|v| format!("${v:.2}"))
-                    .unwrap_or_else(|| "?".into());
+                let (margin, commission) = preview_margin_commission(&state);
                 self.status = format!(
                     "preview {} put spread {:.1}/{:.1} @{:.2}cr ×{}: margin {} · commission {} · {}",
                     sug.symbol, sug.strike, long_strike, sug.limit_price, sug.quantity, margin,
@@ -912,18 +953,11 @@ impl App {
         );
         let entry_base = NewJournalEntry {
             note: Some(note),
-            ..journal_entry_for(sug, &expiry, right_char(sug.right))
+            ..journal_entry_for(sug, &expiry, sug.right.code())
         };
         match ibkr.submit_or_preview_combo(&order, preview).await {
             Ok(OrderOutcome::Preview(state)) => {
-                let margin = state
-                    .initial_margin_after
-                    .map(|v| format!("${v:.0}"))
-                    .unwrap_or_else(|| "?".into());
-                let commission = state
-                    .commission
-                    .map(|v| format!("${v:.2}"))
-                    .unwrap_or_else(|| "?".into());
+                let (margin, commission) = preview_margin_commission(&state);
                 self.status = format!(
                     "preview {} {} ×{}: margin {} (≈max loss ${:.0}) · commission {} · {}",
                     sug.symbol,
@@ -996,7 +1030,7 @@ impl App {
                 format!("roll {}: blocked for new positions — close it instead", sug.symbol);
             return Ok(());
         }
-        let right = right_char(sug.right);
+        let right = sug.right.code();
         let near_expiry = sug.expiry.format("%Y%m%d").to_string();
         let today = Local::now().date_naive();
 
@@ -1095,7 +1129,7 @@ impl App {
                 format!("roll {}: already in flight — wait for the close to fill", sug.symbol);
             return Ok(());
         }
-        let right = right_char(sug.right);
+        let right = sug.right.code();
         let near_expiry = sug.expiry.format("%Y%m%d").to_string();
         let today = Local::now().date_naive();
 
@@ -1230,6 +1264,22 @@ impl App {
             // Keep the persisted row so a connected session retries.
             return Ok(format!("roll {}: not connected — new leg not opened", pr.symbol));
         };
+        // Re-assert the guardrails at this transmit boundary too (the close already
+        // filled, so this path can fire from reconnect/fill reconcile with no other
+        // gate). Keep the persisted pending-roll row so the open retries once the
+        // guard is lifted — don't strand the roll silently.
+        if self.cfg.guardrails.read_only {
+            return Ok(format!(
+                "roll {}: read_only — new leg not opened (kept pending for retry)",
+                pr.symbol
+            ));
+        }
+        if pr.quantity > self.cfg.guardrails.max_contracts_per_order {
+            return Ok(format!(
+                "roll {}: qty {} over max_contracts_per_order — new leg not opened (kept pending)",
+                pr.symbol, pr.quantity
+            ));
+        }
         let far = OptionOrder {
             symbol: &pr.symbol,
             expiry_yyyymmdd: &pr.to_expiry,
@@ -1355,6 +1405,14 @@ impl App {
         if !self.cfg.zerodte.strategies.iter().any(|p| p.automate) {
             return; // nothing armed for automation
         }
+        if !self.live_gate_ok() {
+            // Live mode + require_live_confirmation: no unattended entry until the
+            // user has confirmed live trading this session.
+            self.status = format!(
+                "⚡ LIVE auto-trading paused — press `L` and type {LIVE_CONFIRM_PHRASE} to confirm this session"
+            );
+            return;
+        }
         let now_et = schedule::eastern_wall(Local::now().naive_utc());
         let today_str = now_et.date().format("%Y-%m-%d").to_string();
         let positions = store.list_zerodte_positions().await.unwrap_or_default();
@@ -1404,7 +1462,7 @@ impl App {
                             quantity: sug.quantity as i64,
                             max_loss: sug.capital_required,
                             profit_target_pct: params.profit_target_pct,
-                            status: "pending".into(),
+                            status: zerodte_status::PENDING.into(),
                             close_oid: None,
                             entry_date: today_str.clone(),
                             created_at: String::new(),
@@ -1412,11 +1470,11 @@ impl App {
                         .await;
                     let _ = store
                         .record(&NewJournalEntry {
-                            status: "submitted".into(),
+                            status: journal_status::SUBMITTED.into(),
                             ibkr_order_id: Some(oid.clone()),
                             premium: Some(sug.premium_total),
                             note: Some(format!("AUTO entry: {} {}DTE", kind.label(), sug.dte)),
-                            ..journal_entry_for(&sug, &expiry, right_char(sug.right))
+                            ..journal_entry_for(&sug, &expiry, sug.right.code())
                         })
                         .await;
                     self.status =
@@ -1437,7 +1495,7 @@ impl App {
         // for the defined-risk default both are off and the wings are the stop).
         let mut closed_any = false;
         for p in &positions {
-            if p.status != "open" {
+            if p.status != zerodte_status::OPEN {
                 continue;
             }
             let (stop_mult, time_stop) = match self.cfg.zerodte.slot(p.slot as usize) {
@@ -1490,6 +1548,52 @@ impl App {
         }
     }
 
+    /// Submit a (reversed-leg) closing combo for a 0DTE position and, on a live
+    /// submission, move it to `spec.status` keyed on the close order id and journal
+    /// the leg. The shared core of the standing profit-close and the active
+    /// stop/time-stop close, so the two can't drift on how a close is recorded.
+    /// Returns the close order id, or an error string for the caller to surface.
+    /// Does NOT enforce guardrails or cancel any standing order — the caller owns
+    /// those (and the `self.status` / return-type framing).
+    async fn submit_zerodte_close(
+        &self,
+        ibkr: &Ibkr,
+        p: &ZeroDtePositionRow,
+        close_legs: &[ComboLeg],
+        spec: ZerodteClose,
+        store: &Store,
+    ) -> std::result::Result<String, String> {
+        let order = ComboOrder {
+            symbol: &p.underlying,
+            expiry_yyyymmdd: &p.expiry,
+            legs: close_legs,
+            quantity: p.quantity as i32,
+            net_credit: -spec.debit, // a debit close: negated into a +debit combo limit
+        };
+        match ibkr.submit_or_preview_combo(&order, false).await {
+            Ok(OrderOutcome::Submitted(oid)) => {
+                let _ = store
+                    .update_zerodte_status(&p.entry_oid, spec.status, Some(&oid))
+                    .await;
+                let _ = store
+                    .record(&NewJournalEntry {
+                        symbol: p.underlying.clone(),
+                        action: spec.action,
+                        quantity: p.quantity,
+                        limit_price: Some(spec.debit),
+                        status: journal_status::SUBMITTED.into(),
+                        ibkr_order_id: Some(oid.clone()),
+                        note: Some(spec.note),
+                        ..Default::default()
+                    })
+                    .await;
+                Ok(oid)
+            }
+            Ok(OrderOutcome::Preview(_)) => Err("unexpected preview".into()),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
     /// Actively close an open structure now (stop-loss or time-stop): cancel the
     /// standing profit-close, then submit a marketable buy-to-close at the current
     /// cost plus a small buffer so it fills. Moves the position to `closing` keyed
@@ -1502,6 +1606,18 @@ impl App {
         reason: &str,
         store: &Store,
     ) -> bool {
+        // Re-assert the kill-switch / order-size cap at the transmit boundary. The
+        // scheduler already checks `read_only`, but guarding here too keeps the rule
+        // local to the order rather than dependent on the caller; under `read_only`
+        // we don't even cancel the standing close (the wings remain the stop).
+        let qty = p.quantity as i32;
+        if self.cfg.guardrails.read_only {
+            return false;
+        }
+        if qty > self.cfg.guardrails.max_contracts_per_order {
+            tracing::warn!("0DTE {}: qty {qty} over max_contracts_per_order — not closing", p.strategy);
+            return false;
+        }
         // Pull the standing profit-close first so we don't double-close.
         if let Some(old) = &p.close_oid
             && let Err(e) = ibkr.cancel_order(old).await
@@ -1510,33 +1626,18 @@ impl App {
         }
         let close_legs = reverse_legs(&decode_legs(&p.legs));
         let limit_debit = (cost_to_close + 0.20).max(0.0); // marketable buffer; tick-rounded in ibkr
-        let order = ComboOrder {
-            symbol: &p.underlying,
-            expiry_yyyymmdd: &p.expiry,
-            legs: &close_legs,
-            quantity: p.quantity as i32,
-            net_credit: -limit_debit,
+        let spec = ZerodteClose {
+            debit: limit_debit,
+            status: zerodte_status::CLOSING,
+            action: format!("{} {reason}", p.strategy),
+            note: format!("AUTO {reason} close @ ~{limit_debit:.2} debit"),
         };
-        match ibkr.submit_or_preview_combo(&order, false).await {
-            Ok(OrderOutcome::Submitted(oid)) => {
-                let _ = store.update_zerodte_status(&p.entry_oid, "closing", Some(&oid)).await;
-                let _ = store
-                    .record(&NewJournalEntry {
-                        symbol: p.underlying.clone(),
-                        action: format!("{} {reason}", p.strategy),
-                        quantity: p.quantity,
-                        limit_price: Some(limit_debit),
-                        status: "submitted".into(),
-                        ibkr_order_id: Some(oid.clone()),
-                        note: Some(format!("AUTO {reason} close @ ~{limit_debit:.2} debit")),
-                        ..Default::default()
-                    })
-                    .await;
+        match self.submit_zerodte_close(ibkr, p, &close_legs, spec, store).await {
+            Ok(oid) => {
                 self.status = format!("⚡ {} {reason} → closing (id {oid})", p.strategy);
                 tracing::info!("0DTE {} {reason} close id {oid}", p.strategy);
                 true
             }
-            Ok(OrderOutcome::Preview(_)) => false,
             Err(e) => {
                 tracing::warn!("0DTE {} {reason} close failed: {e}", p.strategy);
                 self.status = format!("⚡ {} {reason} close failed: {e}", p.strategy);
@@ -1556,40 +1657,41 @@ impl App {
         p: &ZeroDtePositionRow,
         store: &Store,
     ) -> std::result::Result<String, String> {
+        // Honor the kill-switch / order-size cap at the transmit boundary itself —
+        // this runs from reconnect/auto-reload reconcile and the fill handler, none
+        // of which re-check the guardrails. Leaving the position `open` with no
+        // standing close is safe: for a defined-risk structure the wings are the
+        // stop, so the loss is still capped.
+        let qty = p.quantity as i32;
+        if self.cfg.guardrails.read_only {
+            let _ = store.update_zerodte_status(&p.entry_oid, zerodte_status::OPEN, None).await;
+            return Err("read_only — profit-close not placed (wings cap the loss)".into());
+        }
+        if qty > self.cfg.guardrails.max_contracts_per_order {
+            let _ = store.update_zerodte_status(&p.entry_oid, zerodte_status::OPEN, None).await;
+            return Err(format!(
+                "qty {qty} over max_contracts_per_order — profit-close not placed"
+            ));
+        }
         let close_debit = (p.entry_credit * (1.0 - p.profit_target_pct)).max(0.0);
         let close_legs = reverse_legs(&decode_legs(&p.legs));
-        let order = ComboOrder {
-            symbol: &p.underlying,
-            expiry_yyyymmdd: &p.expiry,
-            legs: &close_legs,
-            quantity: p.quantity as i32,
-            net_credit: -close_debit, // a debit close: negated into a +debit limit
+        let note = format!(
+            "AUTO profit-close @ {:.0}% (debit {close_debit:.2})",
+            p.profit_target_pct * 100.0
+        );
+        let spec = ZerodteClose {
+            debit: close_debit,
+            status: zerodte_status::OPEN,
+            action: format!("{} close", p.strategy),
+            note,
         };
-        match ibkr.submit_or_preview_combo(&order, false).await {
-            Ok(OrderOutcome::Submitted(close_oid)) => {
-                let _ = store.update_zerodte_status(&p.entry_oid, "open", Some(&close_oid)).await;
-                let _ = store
-                    .record(&NewJournalEntry {
-                        symbol: p.underlying.clone(),
-                        action: format!("{} close", p.strategy),
-                        quantity: p.quantity,
-                        limit_price: Some(close_debit),
-                        status: "submitted".into(),
-                        ibkr_order_id: Some(close_oid.clone()),
-                        note: Some(format!(
-                            "AUTO profit-close @ {:.0}% (debit {:.2})",
-                            p.profit_target_pct * 100.0,
-                            close_debit
-                        )),
-                        ..Default::default()
-                    })
-                    .await;
-                Ok(close_oid)
-            }
-            Ok(OrderOutcome::Preview(_)) => Err("unexpected preview".into()),
+        match self.submit_zerodte_close(ibkr, p, &close_legs, spec, store).await {
+            Ok(oid) => Ok(oid),
             Err(e) => {
-                let _ = store.update_zerodte_status(&p.entry_oid, "open", None).await;
-                Err(e.to_string())
+                // Couldn't place the standing close — keep the position `open` with
+                // no close order (the wings still cap the loss) and surface the error.
+                let _ = store.update_zerodte_status(&p.entry_oid, zerodte_status::OPEN, None).await;
+                Err(e)
             }
         }
     }
@@ -1607,7 +1709,7 @@ impl App {
         let Some(ibkr) = self.ibkr.clone() else { return };
         let positions = store.list_zerodte_positions().await.unwrap_or_default();
         for p in &positions {
-            if matches!(p.status.as_str(), "closed" | "cancelled") {
+            if matches!(p.status.as_str(), zerodte_status::CLOSED | zerodte_status::CANCELLED) {
                 continue;
             }
             let held = structure_held(broker_positions, p);
@@ -1619,11 +1721,11 @@ impl App {
             match reconcile_action(&p.status, held, entry_open, close_open) {
                 ZerodteReconcile::Leave => {}
                 ZerodteReconcile::Closed => {
-                    let _ = store.update_zerodte_status(&p.entry_oid, "closed", None).await;
+                    let _ = store.update_zerodte_status(&p.entry_oid, zerodte_status::CLOSED, None).await;
                     tracing::info!("0DTE {}: reconciled to closed (shorts gone)", p.strategy);
                 }
                 ZerodteReconcile::Cancelled => {
-                    let _ = store.update_zerodte_status(&p.entry_oid, "cancelled", None).await;
+                    let _ = store.update_zerodte_status(&p.entry_oid, zerodte_status::CANCELLED, None).await;
                     tracing::info!("0DTE {}: reconciled to cancelled (entry never filled)", p.strategy);
                 }
                 ZerodteReconcile::PlaceClose => {
@@ -1648,16 +1750,18 @@ impl App {
     ) -> Result<Option<String>> {
         let positions = store.list_zerodte_positions().await?;
         // Entry leg → place the profit-close on a full fill.
-        if let Some(p) = positions.iter().find(|p| p.entry_oid == oid && p.status == "pending") {
+        if let Some(p) =
+            positions.iter().find(|p| p.entry_oid == oid && p.status == zerodte_status::PENDING)
+        {
             match journal_status {
-                Some("filled") => {
+                Some(journal_status::FILLED) => {
                     let Some(ibkr) = self.ibkr.clone() else { return Ok(None) };
                     return Ok(Some(match self.place_profit_close(&ibkr, p, store).await {
                         Ok(_) => format!("⚡ {} filled → profit-close placed", p.strategy),
                         Err(e) => format!("⚡ {} filled, profit-close failed: {e}", p.strategy),
                     }));
                 }
-                Some(js @ ("cancelled" | "rejected")) => {
+                Some(js @ (journal_status::CANCELLED | journal_status::REJECTED)) => {
                     store.update_zerodte_status(&p.entry_oid, js, None).await?;
                     return Ok(Some(format!("⚡ {} entry {js}", p.strategy)));
                 }
@@ -1666,9 +1770,9 @@ impl App {
         }
         // Close leg → mark closed on a full fill.
         if let Some(p) = positions.iter().find(|p| p.close_oid.as_deref() == Some(oid))
-            && journal_status == Some("filled")
+            && journal_status == Some(journal_status::FILLED)
         {
-            store.update_zerodte_status(&p.entry_oid, "closed", None).await?;
+            store.update_zerodte_status(&p.entry_oid, zerodte_status::CLOSED, None).await?;
             return Ok(Some(format!("⚡ {} profit-closed", p.strategy)));
         }
         Ok(None)
@@ -1838,94 +1942,38 @@ impl App {
     /// are reconciled into the local store *before* suggestions are computed, so
     /// each symbol is advised in the leg it is actually in (entry, manage, or
     /// covered call) rather than always being treated as idle.
+    /// Synchronous data reload — the fallback path of [`App::request_reload`].
+    ///
+    /// The connected case delegates to the very same [`gather`] + [`apply_live_data`]
+    /// pipeline the off-loop refresh uses, so the startup/steady-state paths can't
+    /// drift (single source of truth for the reload sequence). In practice the run
+    /// loop wires the update channel before the first refresh, so this only runs
+    /// while *offline* (loading demo data) — but routing the connected case through
+    /// `gather` keeps it correct if ever reached directly.
     async fn reload(&mut self, store: &Store) -> Result<()> {
-        self.watchlist = store.list_watchlist().await?;
-        self.journal = store.recent_journal(200).await?;
         let today = Local::now().date_naive();
 
         if let Some(ibkr) = self.ibkr.clone() {
-            self.account = ibkr.account_summary().await.ok();
-            // Probe tradability for still-unknown symbols *before* planning, then
-            // refresh the watchlist, so a symbol the probe blocks (PRIIPs /
-            // permissions) is excluded from this pass's suggestions rather than
-            // surfacing an executable order for an instrument we can't trade.
-            probe_unknown_tradability(&ibkr, store, &self.watchlist, today).await;
-            self.watchlist = store.list_watchlist().await?;
-            // Only sync + recompute on a *complete* positions snapshot. A failed
-            // or partial fetch must not be mistaken for "all positions closed",
-            // which would wipe local state and suggest new entries against
-            // symbols that still have open positions — so we keep the last known
-            // state untouched on error.
-            match ibkr.positions().await {
-                Ok(positions) => {
-                    self.broker_positions = positions;
-                    sync_wheel_state(store, &self.broker_positions).await;
-                    // Authoritative open orders drive both: which symbols to skip
-                    // (a live order in flight) and reconciling pending rolls. On a
-                    // failed snapshot, fall back to the journal's "submitted" rows.
-                    let working = match ibkr.open_orders_snapshot().await {
-                        Ok(open) => {
-                            let bp = self.broker_positions.clone();
-                            self.reconcile_pending_rolls(&open, &bp, store).await;
-                            self.reconcile_zerodte_positions(&open, &bp, store).await;
-                            let mut w: Vec<String> = open.into_iter().map(|o| o.symbol).collect();
-                            // Also suppress symbols with an in-flight roll whose
-                            // close order may not be in the snapshot yet (just
-                            // submitted), closing the broker-ack race window.
-                            w.extend(self.pending_rolls.iter().map(|p| p.symbol.clone()));
-                            w
-                        }
-                        Err(e) => {
-                            tracing::warn!("open orders unavailable ({e}); using journal fallback");
-                            store.symbols_with_working_orders().await.unwrap_or_default()
-                        }
-                    };
-                    let (classic, hedged) = live_suggestions(
-                        &ibkr,
-                        store,
-                        &self.watchlist,
-                        &self.broker_positions,
-                        &working,
-                        &self.cfg,
-                        today,
-                    )
-                    .await;
-                    self.suggestions = classic;
-                    self.hedged_suggestions = hedged;
-                    self.zerodte_suggestions = structure_suggestions(
-                        &ibkr,
-                        &self.cfg.zerodte,
-                        self.cfg.engine.risk_free_rate,
-                        today,
-                    )
-                    .await;
-                }
-                Err(e) => {
-                    // Positions are unknown: preserve the stored wheel state for
-                    // the dashboard, but clear suggestions so no stale, still-
-                    // executable action survives against an account we can no
-                    // longer see.
-                    tracing::warn!("positions fetch failed; clearing suggestions, keeping stored state: {e}");
-                    self.suggestions.clear();
-                    self.zerodte_suggestions.clear();
-                    self.status =
-                        "broker positions unavailable — suggestions cleared until refresh".into();
-                }
-            }
-        } else {
-            let symbols: Vec<String> = self
-                .watchlist
-                .iter()
-                .filter(|r| r.is_enabled())
-                .map(|r| r.symbol.clone())
-                .collect();
-            self.suggestions = demo::demo_suggestions(&symbols, &self.cfg.engine, today);
-            self.zerodte_suggestions =
-                demo::demo_zerodte(&self.cfg.zerodte, &self.cfg.engine, today);
+            let pending: Vec<String> =
+                self.pending_rolls.iter().map(|p| p.symbol.clone()).collect();
+            let data = gather(&ibkr, store, &self.cfg, &pending, today).await;
+            // Boxed: `apply_live_data` may re-enter `request_reload` → `reload`,
+            // so the future is (indirectly) recursive and needs the indirection.
+            Box::pin(self.apply_live_data(data, store)).await;
+            return Ok(());
         }
 
-        // Load the (possibly just-synced) wheel positions last so the dashboard
-        // reflects holdings.
+        // Offline: run the real engine over Black-Scholes-consistent demo chains.
+        self.watchlist = store.list_watchlist().await?;
+        self.journal = store.recent_journal(200).await?;
+        let symbols: Vec<String> = self
+            .watchlist
+            .iter()
+            .filter(|r| r.is_enabled())
+            .map(|r| r.symbol.clone())
+            .collect();
+        self.suggestions = demo::demo_suggestions(&symbols, &self.cfg.engine, today);
+        self.zerodte_suggestions = demo::demo_zerodte(&self.cfg.zerodte, &self.cfg.engine, today);
         self.positions = store.list_positions().await?;
 
         if self.selected >= self.list_len() {
@@ -1964,11 +2012,6 @@ impl App {
     /// Record why we're offline (shown on the dashboard).
     pub(super) fn set_offline_reason(&mut self, reason: String) {
         self.offline_reason = Some(reason);
-    }
-
-    /// Whether a background reload is currently in flight (drives the UI spinner).
-    pub fn is_loading(&self) -> bool {
-        self.reloading
     }
 
     /// Elapsed time of the in-flight background reload (for the UI loading timer).
@@ -2111,17 +2154,6 @@ fn journal_status_for(ibkr_status: &str) -> Option<&'static str> {
     }
 }
 
-fn format_kind(k: &ActionKind) -> String {
-    match k {
-        ActionKind::SellPut => "SellPut".into(),
-        ActionKind::SellCall => "SellCall".into(),
-        ActionKind::CloseForProfit => "Close".into(),
-        ActionKind::Roll { .. } => "Roll".into(),
-        ActionKind::SellPutSpread { .. } => "SellPutSpread".into(),
-        ActionKind::OpenStructure { kind, .. } => kind.label().into(),
-    }
-}
-
 fn side_and_right(sug: &Suggestion) -> Option<(Side, &'static str)> {
     match (&sug.kind, sug.right) {
         (ActionKind::SellPut, _) => Some((Side::Sell, "P")),
@@ -2149,18 +2181,35 @@ fn encode_legs(legs: &[ComboLeg]) -> String {
         .join(";")
 }
 
-/// Inverse of [`encode_legs`].
+/// Inverse of [`encode_legs`]. **Strict**: a single malformed segment voids the
+/// whole blob (returns empty) rather than yielding a *partial* leg set — a close
+/// built from fewer legs than the entry would be a mis-hedged or naked order. An
+/// empty result makes any downstream combo fail the ">= 2 legs" check loudly
+/// instead of transmitting a truncated package.
 fn decode_legs(s: &str) -> Vec<ComboLeg> {
-    s.split(';')
-        .filter_map(|seg| {
-            let mut it = seg.split(':');
-            let action = if it.next()? == "B" { Side::Buy } else { Side::Sell };
+    let mut out = Vec::new();
+    for seg in s.split(';') {
+        let mut it = seg.split(':');
+        let leg = (|| {
+            let action = match it.next()? {
+                "B" => Side::Buy,
+                "S" => Side::Sell,
+                _ => return None,
+            };
             let strike: f64 = it.next()?.parse().ok()?;
-            let right = if it.next()? == "C" { "C" } else { "P" };
+            let right = Right::from_code(it.next()?).code();
             let ratio: i32 = it.next()?.parse().ok()?;
             Some(ComboLeg { strike, right, action, ratio })
-        })
-        .collect()
+        })();
+        match leg {
+            Some(l) => out.push(l),
+            None => {
+                tracing::warn!("decode_legs: malformed leg blob {s:?} — discarding all legs");
+                return Vec::new();
+            }
+        }
+    }
+    out
 }
 
 /// The profit-close legs: the entry combo with every leg's side flipped. Buying
@@ -2183,10 +2232,7 @@ fn reverse_legs(legs: &[ComboLeg]) -> Vec<ComboLeg> {
 fn combo_legs_from(legs: &[StructureLeg]) -> Vec<ComboLeg> {
     let mut out: Vec<ComboLeg> = Vec::new();
     for l in legs {
-        let right = match l.right {
-            Right::Put => "P",
-            Right::Call => "C",
-        };
+        let right = l.right.code();
         let action = match l.side {
             LegSide::Buy => Side::Buy,
             LegSide::Sell => Side::Sell,
@@ -2201,6 +2247,17 @@ fn combo_legs_from(legs: &[StructureLeg]) -> Vec<ComboLeg> {
         }
     }
     out
+}
+
+/// What a 0DTE close should do: the debit it's submitted at, the lifecycle status
+/// it moves the position to, and the journal action/note. Bundles the descriptor
+/// fields of [`App::submit_zerodte_close`] so the profit-close and stop-close
+/// callers pass one value instead of a long argument list.
+struct ZerodteClose {
+    debit: f64,
+    status: &'static str,
+    action: String,
+    note: String,
 }
 
 /// The restart-reconcile verdict for one persisted 0DTE position, from whether its
@@ -2220,7 +2277,7 @@ enum ZerodteReconcile {
 /// Pure restart-reconcile decision (see [`App::reconcile_zerodte_positions`]).
 fn reconcile_action(status: &str, held: bool, entry_open: bool, close_open: bool) -> ZerodteReconcile {
     match status {
-        "pending" => {
+        zerodte_status::PENDING => {
             if held && !close_open {
                 ZerodteReconcile::PlaceClose // entry filled while down
             } else if !held && !entry_open {
@@ -2229,7 +2286,7 @@ fn reconcile_action(status: &str, held: bool, entry_open: bool, close_open: bool
                 ZerodteReconcile::Leave // entry still working
             }
         }
-        "open" | "closing" => {
+        zerodte_status::OPEN | zerodte_status::CLOSING => {
             if !held {
                 ZerodteReconcile::Closed // closed / expired while down
             } else if !close_open {
@@ -2254,7 +2311,7 @@ fn structure_held(broker_positions: &[PositionRow], p: &ZeroDtePositionRow) -> b
 fn journal_entry_for(sug: &Suggestion, expiry: &str, right_str: &str) -> NewJournalEntry {
     NewJournalEntry {
         symbol: sug.symbol.clone(),
-        action: format_kind(&sug.kind),
+        action: sug.kind.persist_key(),
         right: Some(right_str.to_string()),
         strike: Some(sug.strike),
         expiry: Some(expiry.to_string()),
@@ -2293,16 +2350,25 @@ fn roll_leg_journal(
 }
 
 
+/// Format a what-if preview's margin and commission for the status bar, as
+/// `(margin, commission)` with `"?"` where the broker omitted a value. One source
+/// for the formatting the single-leg / spread / structure preview paths share.
+fn preview_margin_commission(state: &OrderState) -> (String, String) {
+    let margin = state
+        .initial_margin_after
+        .map(|v| format!("${v:.0}"))
+        .unwrap_or_else(|| "?".into());
+    let commission = state
+        .commission
+        .map(|v| format!("${v:.2}"))
+        .unwrap_or_else(|| "?".into());
+    (margin, commission)
+}
+
 /// One-line summary of a what-if leg for the status bar (margin or error).
 fn preview_summary(res: &Result<OrderOutcome>) -> String {
     match res {
-        Ok(OrderOutcome::Preview(state)) => format!(
-            "margin {}",
-            state
-                .initial_margin_after
-                .map(|v| format!("${v:.0}"))
-                .unwrap_or_else(|| "?".into())
-        ),
+        Ok(OrderOutcome::Preview(state)) => format!("margin {}", preview_margin_commission(state).0),
         Ok(OrderOutcome::Submitted(_)) => "?".into(),
         Err(e) => format!("err: {e}"),
     }
@@ -2312,6 +2378,7 @@ fn preview_summary(res: &Result<OrderOutcome>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::live::sync_wheel_state;
     use chrono::NaiveDate;
 
     #[tokio::test]
@@ -2578,6 +2645,97 @@ mod tests {
         app.execute_suggestion(&sell_put_spread(1), &store).await.unwrap();
         assert!(app.status.contains("read_only"), "status: {}", app.status);
         assert!(store.recent_journal(10).await.unwrap().is_empty());
+    }
+
+    fn short_put_at(symbol: &str, strike: f64, contracts: f64) -> PositionRow {
+        PositionRow {
+            account: String::new(),
+            symbol: symbol.into(),
+            security_type: "Option".into(),
+            right: "P".into(),
+            strike,
+            expiry: "20260619".into(),
+            position: -contracts,
+            average_cost: 0.0,
+            multiplier: "100".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_blocked_when_over_total_deployed() {
+        // A 100-strike CSP needs $10k collateral; with a $5k cap it must be blocked
+        // before any broker call, regardless of the per-pass sizing budget.
+        let store = Store::open_in_memory().await.unwrap();
+        let mut app = offline_app(&store).await;
+        app.armed = true;
+        app.cfg.guardrails.read_only = false;
+        app.cfg.guardrails.max_contracts_per_order = 10;
+        app.cfg.guardrails.max_total_deployed = 5_000.0;
+        app.execute_suggestion(&sell_put(1), &store).await.unwrap();
+        assert!(app.status.contains("max_total_deployed"), "status: {}", app.status);
+        assert!(store.recent_journal(10).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn deployment_cap_counts_already_deployed_collateral() {
+        // Already short one 100-strike put ($10k deployed); a new $10k CSP would
+        // total $20k, over a $15k cap — the cap must see the existing position.
+        let store = Store::open_in_memory().await.unwrap();
+        let mut app = offline_app(&store).await;
+        app.armed = true;
+        app.cfg.guardrails.read_only = false;
+        app.cfg.guardrails.max_contracts_per_order = 10;
+        app.cfg.guardrails.max_total_deployed = 15_000.0;
+        app.broker_positions = vec![short_put_at("MSFT", 100.0, 1.0)];
+        app.execute_suggestion(&sell_put(1), &store).await.unwrap();
+        assert!(app.status.contains("already deployed"), "status: {}", app.status);
+        assert!(store.recent_journal(10).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn execute_blocked_until_live_confirmed() {
+        // Live mode + require_live_confirmation: armed and within all other limits
+        // is still not enough — the session must be confirmed first.
+        let store = Store::open_in_memory().await.unwrap();
+        let mut app = offline_app(&store).await;
+        app.armed = true;
+        app.cfg.guardrails.read_only = false;
+        app.cfg.connection.mode = TradingMode::Live;
+        app.cfg.guardrails.require_live_confirmation = true;
+        assert!(!app.live_gate_ok());
+        app.execute_suggestion(&sell_put(1), &store).await.unwrap();
+        assert!(app.status.contains("LIVE not confirmed"), "status: {}", app.status);
+        assert!(store.recent_journal(10).await.unwrap().is_empty());
+        // Typing the phrase this session unlocks the gate.
+        app.live_confirmed = true;
+        assert!(app.live_gate_ok());
+    }
+
+    #[tokio::test]
+    async fn submit_input_confirms_live_only_on_exact_phrase() {
+        let store = Store::open_in_memory().await.unwrap();
+        let mut app = offline_app(&store).await;
+        app.cfg.connection.mode = TradingMode::Live;
+        // Wrong phrase leaves it locked.
+        app.input = InputMode::ConfirmLive("LIV".into());
+        app.dispatch(Action::SubmitInput, &store).await.unwrap();
+        assert!(!app.live_confirmed);
+        assert!(app.status.contains("mismatch"), "status: {}", app.status);
+        // The exact phrase unlocks it for the session.
+        app.input = InputMode::ConfirmLive(LIVE_CONFIRM_PHRASE.into());
+        app.dispatch(Action::SubmitInput, &store).await.unwrap();
+        assert!(app.live_confirmed);
+    }
+
+    #[test]
+    fn decode_legs_voids_a_partial_blob() {
+        // A well-formed 2-leg blob round-trips.
+        let good = "S:7510:P:1;B:7480:P:1";
+        assert_eq!(decode_legs(good).len(), 2);
+        // A malformed segment voids the WHOLE set rather than yielding a partial
+        // (a truncated close would be a naked/mis-hedged order).
+        assert!(decode_legs("S:7510:P:1;B:garbage:P:1").is_empty());
+        assert!(decode_legs("S:7510:P").is_empty());
     }
 
     // --- order-event → journal transitions (the fill/cancel tracking path) ---
