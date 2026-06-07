@@ -5,7 +5,7 @@
 use chrono::{Duration, NaiveDate};
 
 use crate::config::ZeroDteConfig;
-use crate::engine::math::{bs_delta, norm_cdf};
+use crate::engine::math::{bs_delta, fcmp, norm_cdf};
 use crate::engine::types::{EngineConfig, OptionQuote, Right, Suggestion, UnderlyingQuote};
 use crate::engine::{csp, structures};
 
@@ -22,12 +22,18 @@ pub fn demo_spot(symbol: &str) -> f64 {
     50.0 + f64::from(h % 250)
 }
 
+/// The shared Black-Scholes `d1`/`d2` terms. Callers guard `t > 0` and `sig > 0`.
+fn d1_d2(s: f64, k: f64, t: f64, r: f64, sig: f64) -> (f64, f64) {
+    let d1 = ((s / k).ln() + (r + 0.5 * sig * sig) * t) / (sig * t.sqrt());
+    let d2 = d1 - sig * t.sqrt();
+    (d1, d2)
+}
+
 fn bs_put_price(s: f64, k: f64, t: f64, r: f64, sig: f64) -> f64 {
     if t <= 0.0 || sig <= 0.0 {
         return (k - s).max(0.0);
     }
-    let d1 = ((s / k).ln() + (r + 0.5 * sig * sig) * t) / (sig * t.sqrt());
-    let d2 = d1 - sig * t.sqrt();
+    let (d1, d2) = d1_d2(s, k, t, r, sig);
     k * (-r * t).exp() * norm_cdf(-d2) - s * norm_cdf(-d1)
 }
 
@@ -51,7 +57,6 @@ fn demo_puts(spot: f64, today: NaiveDate, dte: i64) -> Vec<OptionQuote> {
                 delta,
                 implied_volatility: Some(DEMO_IV),
                 open_interest: Some(800),
-                volume: Some(200),
             });
         }
         k += step;
@@ -73,11 +78,7 @@ pub fn demo_suggestions(symbols: &[String], cfg: &EngineConfig, today: NaiveDate
         }
     }
     // Best annualized yield first.
-    out.sort_by(|a, b| {
-        b.annualized_yield
-            .partial_cmp(&a.annualized_yield)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    out.sort_by(|a, b| fcmp(&b.annualized_yield, &a.annualized_yield));
     out
 }
 
@@ -85,8 +86,7 @@ fn bs_call_price(s: f64, k: f64, t: f64, r: f64, sig: f64) -> f64 {
     if t <= 0.0 || sig <= 0.0 {
         return (s - k).max(0.0);
     }
-    let d1 = ((s / k).ln() + (r + 0.5 * sig * sig) * t) / (sig * t.sqrt());
-    let d2 = d1 - sig * t.sqrt();
+    let (d1, d2) = d1_d2(s, k, t, r, sig);
     s * norm_cdf(d1) - k * (-r * t).exp() * norm_cdf(d2)
 }
 
@@ -145,7 +145,6 @@ fn demo_structure_chain(spot: f64, today: NaiveDate, dte: i64) -> Vec<OptionQuot
                     delta: bs_delta(right, spot, k, t, DEMO_R, iv),
                     implied_volatility: Some(iv),
                     open_interest: Some(2000),
-                    volume: Some(800),
                 });
             }
         }

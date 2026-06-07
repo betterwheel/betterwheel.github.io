@@ -9,5 +9,6 @@ pub mod repo;
 
 pub use models::{
     JournalRow, NewJournalEntry, PendingRollRow, WatchlistRow, WheelPositionRow, ZeroDtePositionRow,
+    journal_status, zerodte_status,
 };
 pub use repo::Store;

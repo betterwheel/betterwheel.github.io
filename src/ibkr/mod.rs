@@ -15,10 +15,14 @@ use tokio::time::timeout;
 
 use ibapi::accounts::types::AccountGroup;
 use ibapi::contracts::{LegAction, OptionChain, OptionComputation};
-use ibapi::orders::{OrderState, Orders};
+use ibapi::orders::{OrderBuilder, Orders};
+// Re-exported (not a fresh `ibapi` import elsewhere): the what-if `OrderState` is
+// already surfaced through `OrderOutcome::Preview`, so callers may name it.
+pub use ibapi::orders::OrderState;
 use ibapi::prelude::*;
 
 use crate::config::{ConnectionConfig, MarketDataPref};
+use crate::engine::math::fcmp;
 
 /// Connected handle to IB Gateway / TWS.
 #[derive(Clone)]
@@ -70,6 +74,36 @@ fn round_to_tick(price: f64, tick: f64) -> f64 {
         return price;
     }
     (price / tick).round() * tick
+}
+
+/// The shared preview-or-submit tail for every order path (single-leg, spread,
+/// N-leg combo). Owning the what-if timeout, the read-only hint, the error
+/// wording, and the submitted-id formatting in one place is what keeps the
+/// preview and execute paths from drifting apart — the whole point of routing
+/// every order through one entry per shape. `label` is the order's `Display`
+/// form, used only for error context.
+async fn finish_order(
+    ready: OrderBuilder<'_, Client>,
+    preview: bool,
+    label: impl std::fmt::Display,
+) -> Result<OrderOutcome> {
+    if preview {
+        // Bound the what-if: it never transmits, and a read-only Gateway can
+        // otherwise leave `analyze()` pending indefinitely.
+        let state = timeout(Duration::from_secs(10), ready.analyze())
+            .await
+            .map_err(|_| anyhow!("preview {label}: timed out (is the Gateway API read-only?)"))?
+            .map_err(|e| anyhow!("preview {label}: {e}"))?;
+        Ok(OrderOutcome::Preview(Box::new(state)))
+    } else {
+        let id = ready
+            .submit()
+            .await
+            .map_err(|e| anyhow!("submit {label}: {e}"))?;
+        // Store the bare numeric id so it matches `OrderStatus.order_id` from the
+        // update stream (see `stream_order_events`).
+        Ok(OrderOutcome::Submitted(id.0.to_string()))
+    }
 }
 
 /// Turn a [`Ibkr::connect`] failure into a short, actionable hint for the UI.
@@ -303,7 +337,7 @@ impl Ibkr {
         .await;
 
         let mut meta = base.ok_or_else(|| anyhow!("no option chain returned for {symbol}"))?;
-        strikes.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        strikes.sort_by(fcmp);
         strikes.dedup_by(|a, b| (*a - *b).abs() < 1e-9);
         meta.expirations = exps.into_iter().collect();
         meta.strikes = strikes;
@@ -386,23 +420,7 @@ impl Ibkr {
             Side::Sell => builder.sell(order.quantity),
         };
         let ready = sided.limit(order.limit).day_order();
-        if preview {
-            // Bound the what-if: it never transmits, and a read-only Gateway can
-            // otherwise leave `analyze()` pending indefinitely.
-            let state = timeout(Duration::from_secs(10), ready.analyze())
-                .await
-                .map_err(|_| anyhow!("preview {order}: timed out (is the Gateway API read-only?)"))?
-                .map_err(|e| anyhow!("preview {order}: {e}"))?;
-            Ok(OrderOutcome::Preview(Box::new(state)))
-        } else {
-            let id = ready
-                .submit()
-                .await
-                .map_err(|e| anyhow!("submit {order}: {e}"))?;
-            // Store the bare numeric id so it matches `OrderStatus.order_id`
-            // from the update stream (see `stream_order_events`).
-            Ok(OrderOutcome::Submitted(id.0.to_string()))
-        }
+        finish_order(ready, preview, order).await
     }
 
     /// Submit (transmit) or preview (what-if) a **defined-risk vertical put
@@ -458,19 +476,7 @@ impl Ibkr {
             .buy(order.quantity)
             .limit(combo_limit)
             .day_order();
-        if preview {
-            let state = timeout(Duration::from_secs(10), ready.analyze())
-                .await
-                .map_err(|_| anyhow!("preview {order}: timed out (is the Gateway API read-only?)"))?
-                .map_err(|e| anyhow!("preview {order}: {e}"))?;
-            Ok(OrderOutcome::Preview(Box::new(state)))
-        } else {
-            let id = ready
-                .submit()
-                .await
-                .map_err(|e| anyhow!("submit {order}: {e}"))?;
-            Ok(OrderOutcome::Submitted(id.0.to_string()))
-        }
+        finish_order(ready, preview, order).await
     }
 
     /// Submit (transmit) or preview (what-if) an **N-leg combo** (BAG) order — the
@@ -523,19 +529,7 @@ impl Ibkr {
             .buy(order.quantity)
             .limit(combo_limit)
             .day_order();
-        if preview {
-            let state = timeout(Duration::from_secs(10), ready.analyze())
-                .await
-                .map_err(|_| anyhow!("preview {order}: timed out (is the Gateway API read-only?)"))?
-                .map_err(|e| anyhow!("preview {order}: {e}"))?;
-            Ok(OrderOutcome::Preview(Box::new(state)))
-        } else {
-            let id = ready
-                .submit()
-                .await
-                .map_err(|e| anyhow!("submit {order}: {e}"))?;
-            Ok(OrderOutcome::Submitted(id.0.to_string()))
-        }
+        finish_order(ready, preview, order).await
     }
 
     /// Cancel a working order by id (fire-and-forget — the terminal status arrives

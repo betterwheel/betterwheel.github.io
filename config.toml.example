@@ -34,10 +34,10 @@ hedge_pct_below = 0.05    # Hedged Wheel: protective put at most this far below 
 hedge_min_credit = 0.10   # Hedged Wheel: skip put spreads with net credit below this
 
 [guardrails]
-max_total_deployed = 50000.0   # cap on total CSP collateral deployed
+max_total_deployed = 50000.0   # hard ceiling on TOTAL short-put collateral (open positions + new entry)
 max_contracts_per_order = 10
-require_live_confirmation = true  # type a phrase before live trading
-read_only = false                 # true disables all order transmits
+require_live_confirmation = true  # in live mode, type LIVE (press `L`) to unlock transmits each session
+read_only = false                 # true disables all order transmits (incl. auto profit-close / roll-open)
 
 # -----------------------------------------------------------------------------
 # 0DTE / short-dated index structures (the "0DTE" tab — a 2x2 grid of slots).

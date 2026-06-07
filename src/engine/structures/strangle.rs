@@ -80,7 +80,6 @@ mod tests {
             delta: Some(delta),
             implied_volatility: Some(0.2),
             open_interest: Some(1000),
-            volume: Some(500),
         }
     }
 

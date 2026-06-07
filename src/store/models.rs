@@ -2,6 +2,30 @@
 
 use sqlx::FromRow;
 
+/// The `journal.status` vocabulary. These strings are matched in safety-relevant
+/// queries (e.g. [`crate::store::Store::symbols_with_working_orders`], which
+/// suppresses new suggestions while an order is working), so every writer must use
+/// these constants rather than bare literals — a typo would silently break the
+/// double-exposure guard.
+pub mod journal_status {
+    pub const PREVIEWED: &str = "previewed";
+    pub const SUBMITTED: &str = "submitted";
+    pub const FILLED: &str = "filled";
+    pub const CANCELLED: &str = "cancelled";
+    pub const REJECTED: &str = "rejected";
+}
+
+/// The `zerodte_positions.status` lifecycle vocabulary. Drives auto-management
+/// reconcile (`pending` → `open` → `closing` → `closed`); use these constants
+/// everywhere the status is written or compared.
+pub mod zerodte_status {
+    pub const PENDING: &str = "pending";
+    pub const OPEN: &str = "open";
+    pub const CLOSING: &str = "closing";
+    pub const CLOSED: &str = "closed";
+    pub const CANCELLED: &str = "cancelled";
+}
+
 /// A watchlist entry.
 #[derive(Debug, Clone, FromRow)]
 pub struct WatchlistRow {

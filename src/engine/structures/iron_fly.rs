@@ -6,6 +6,7 @@
 use chrono::NaiveDate;
 
 use super::{build_defined_risk, leg, nearest_by_strike, StructureParams};
+use crate::engine::math::fcmp;
 use crate::engine::types::{LegSide, OptionQuote, Right, Suggestion};
 
 /// Build the best iron fly for `params`: short put and short call at the listed
@@ -23,12 +24,7 @@ pub fn select(
     let body_put = quotes
         .iter()
         .filter(|q| q.right == Right::Put && q.mid() > 0.0)
-        .min_by(|a, b| {
-            (a.strike - spot)
-                .abs()
-                .partial_cmp(&(b.strike - spot).abs())
-                .unwrap_or(std::cmp::Ordering::Equal)
-        })?;
+        .min_by(|a, b| fcmp(&(a.strike - spot).abs(), &(b.strike - spot).abs()))?;
     let expiry = body_put.expiry;
     let body = body_put.strike;
 
@@ -73,7 +69,6 @@ mod tests {
             delta: Some(if right == Right::Put { -0.5 } else { 0.5 }),
             implied_volatility: Some(0.2),
             open_interest: Some(1000),
-            volume: Some(500),
         }
     }
 

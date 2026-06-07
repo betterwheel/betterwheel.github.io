@@ -22,13 +22,22 @@ pub struct ReconciledPosition {
     /// The open short option to manage (for `ShortPut` / `HedgedShortPut` /
     /// `ShortCall`).
     pub open_short: Option<OpenShortOption>,
-    /// The protective long put under the short (only for `HedgedShortPut`). Same
-    /// expiry, strike below the short. Reuses [`OpenShortOption`] for its
-    /// strike/expiry/quantity; its `entry_credit` is the per-share debit *paid*
-    /// for the protection (sign isn't meaningful here — it's a long, not a short).
-    pub protective_long: Option<OpenShortOption>,
     /// Short calls already written against held shares.
     pub committed_call_contracts: i32,
+}
+
+/// Total cash-secured-put collateral currently deployed, summed over every open
+/// **short put** in `positions` as `strike × 100 × contracts`. This is the figure
+/// the `max_total_deployed` guardrail caps. Hedged short puts are sized against the
+/// same full short-strike notional (see [`crate::engine::csp`]), so counting full
+/// notional here is consistent for both Classic and Hedged positions — and erring
+/// toward the larger figure keeps the cap conservative.
+pub fn deployed_put_collateral(positions: &[PositionRow]) -> f64 {
+    positions
+        .iter()
+        .filter(|p| p.strike > 0.0 && p.position < 0.0 && Right::from_code(&p.right) == Right::Put)
+        .map(|p| p.strike * 100.0 * p.position.abs())
+        .sum()
 }
 
 /// Group a symbol's holdings into its current wheel leg.
@@ -92,25 +101,20 @@ pub fn reconcile(symbol: &str, rows: &[PositionRow]) -> ReconciledPosition {
     // share lot is still carried for the dashboard even while a short is managed.
     if !short_puts.is_empty() {
         let managed = short_puts.into_iter().next().expect("non-empty");
-        // A protective long put = SAME expiry, strike strictly BELOW the short
-        // (a put credit spread). A long above the short, a different expiry, or a
-        // bare long with no short is NOT protective and is ignored — preserving
-        // "the wheel only ever holds short options" everywhere but this hedge.
-        let protective_long = long_puts
-            .into_iter()
-            .filter(|l| l.expiry == managed.expiry && l.strike < managed.strike)
-            // Tightest protection (highest strike below the short) = the paired leg.
-            .max_by(|a, b| a.strike.partial_cmp(&b.strike).unwrap_or(std::cmp::Ordering::Equal));
-        let state = if protective_long.is_some() {
-            WheelState::HedgedShortPut
-        } else {
-            WheelState::ShortPut
-        };
+        // Hedged iff a protective long put exists = SAME expiry, strike strictly
+        // BELOW the short (a put credit spread). A long above the short, a different
+        // expiry, or a bare long with no short is NOT protective and is ignored —
+        // preserving "the wheel only ever holds short options" everywhere but this
+        // hedge detection. Only the *fact* of the hedge drives the state; the leg
+        // itself isn't carried (re-derive it when hedged-close-as-combo lands).
+        let hedged = long_puts
+            .iter()
+            .any(|l| l.expiry == managed.expiry && l.strike < managed.strike);
+        let state = if hedged { WheelState::HedgedShortPut } else { WheelState::ShortPut };
         ReconciledPosition {
             state,
             shares: share_lot,
             open_short: Some(managed),
-            protective_long,
             committed_call_contracts,
         }
     } else if !short_calls.is_empty() {
@@ -118,7 +122,6 @@ pub fn reconcile(symbol: &str, rows: &[PositionRow]) -> ReconciledPosition {
             state: WheelState::ShortCall,
             shares: share_lot,
             open_short: short_calls.into_iter().next(),
-            protective_long: None,
             committed_call_contracts,
         }
     } else if has_lot {
@@ -126,7 +129,6 @@ pub fn reconcile(symbol: &str, rows: &[PositionRow]) -> ReconciledPosition {
             state: WheelState::LongShares,
             shares: share_lot,
             open_short: None,
-            protective_long: None,
             committed_call_contracts: 0,
         }
     } else {
@@ -251,6 +253,19 @@ mod tests {
     }
 
     #[test]
+    fn deployed_collateral_sums_short_puts_only() {
+        let positions = vec![
+            option("AAPL", "P", 95.0, "20260619", -2.0, 180.0), // short 2x → 95*100*2
+            option("MSFT", "P", 100.0, "20260619", 1.0, 150.0), // long put → excluded
+            option("NVDA", "C", 120.0, "20260619", -1.0, 90.0), // short call → excluded
+            stock("AAPL", 100.0, 95.0),                          // shares → excluded
+        ];
+        // Only the short put counts: 95 × 100 × 2 = 19_000.
+        assert!((deployed_put_collateral(&positions) - 19_000.0).abs() < 1e-6);
+        assert_eq!(deployed_put_collateral(&[]), 0.0);
+    }
+
+    #[test]
     fn hundred_shares_is_long_shares() {
         let rows = vec![stock("AAPL", 100.0, 93.25)];
         let r = reconcile("AAPL", &rows);
@@ -341,7 +356,6 @@ mod tests {
         let r = reconcile("AAPL", &rows);
         // A *bare* long put (no short to protect) is still not a wheel position.
         assert_eq!(r.state, WheelState::Idle);
-        assert!(r.protective_long.is_none());
     }
 
     #[test]
@@ -354,9 +368,6 @@ mod tests {
         let r = reconcile("AAPL", &rows);
         assert_eq!(r.state, WheelState::HedgedShortPut);
         assert_eq!(r.open_short.expect("short").strike, 100.0);
-        let long = r.protective_long.expect("protective long");
-        assert_eq!(long.strike, 95.0);
-        assert!((long.entry_credit - 1.00).abs() < 1e-9); // 100/100 debit paid
     }
 
     #[test]
@@ -368,7 +379,6 @@ mod tests {
         ];
         let r = reconcile("AAPL", &rows);
         assert_eq!(r.state, WheelState::ShortPut);
-        assert!(r.protective_long.is_none());
     }
 
     #[test]
@@ -380,12 +390,12 @@ mod tests {
         ];
         let r = reconcile("AAPL", &rows);
         assert_eq!(r.state, WheelState::ShortPut);
-        assert!(r.protective_long.is_none());
     }
 
     #[test]
-    fn tightest_long_is_chosen_as_the_protective_leg() {
-        // Two longs below the short → the highest (tightest) is the paired leg.
+    fn short_put_with_multiple_longs_below_is_still_hedged() {
+        // Two longs below the short → a hedged spread (which leg pairs is the
+        // hedged-close feature's concern, not the state machine's).
         let rows = vec![
             option("AAPL", "P", 100.0, "20260116", -1.0, 250.0),
             option("AAPL", "P", 95.0, "20260116", 1.0, 100.0),
@@ -393,7 +403,6 @@ mod tests {
         ];
         let r = reconcile("AAPL", &rows);
         assert_eq!(r.state, WheelState::HedgedShortPut);
-        assert_eq!(r.protective_long.expect("long").strike, 95.0);
     }
 
     #[test]

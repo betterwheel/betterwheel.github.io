@@ -21,7 +21,7 @@ pub mod strangle;
 use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
 
-use super::math::{dte, resolve_abs_delta, round_cents};
+use super::math::{dte, fcmp, resolve_abs_delta, round_cents};
 use super::types::{
     ActionKind, LegSide, OptionQuote, Right, StructureKind, StructureLeg, Suggestion,
 };
@@ -136,7 +136,7 @@ fn candidate_spots(legs: &[StructureLeg]) -> Vec<f64> {
         max_strike = max_strike.max(l.strike);
     }
     spots.push(max_strike * 2.0);
-    spots.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    spots.sort_by(fcmp);
     spots.dedup_by(|a, b| (*a - *b).abs() < 1e-9);
     spots
 }
@@ -223,7 +223,7 @@ pub(crate) fn nearest_by_delta(
             let d = resolve_abs_delta(q, spot, dte(today, q.expiry).max(0), r)?;
             ((d - target).abs() <= tol).then_some((q, (d - target).abs()))
         })
-        .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+        .min_by(|a, b| fcmp(&a.1, &b.1))
         .map(|(q, _)| q)
 }
 
@@ -239,12 +239,7 @@ pub(crate) fn nearest_by_strike(
     quotes
         .iter()
         .filter(|q| q.right == right && q.expiry == expiry && q.mid() > 0.0)
-        .min_by(|a, b| {
-            (a.strike - target)
-                .abs()
-                .partial_cmp(&(b.strike - target).abs())
-                .unwrap_or(std::cmp::Ordering::Equal)
-        })
+        .min_by(|a, b| fcmp(&(a.strike - target).abs(), &(b.strike - target).abs()))
 }
 
 /// Whether `strike` is out-of-the-money for `right` given `spot`.

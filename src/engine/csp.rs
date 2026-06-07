@@ -2,7 +2,7 @@
 
 use chrono::NaiveDate;
 
-use super::math::{annualized_yield, dte, resolve_abs_delta, round_cents};
+use super::math::{annualized_yield, dte, entry_score, fcmp, passes_short_gates, round_cents};
 use super::types::{ActionKind, EngineConfig, OptionQuote, Right, Suggestion, UnderlyingQuote};
 
 /// Choose the best cash-secured put for `symbol`, or `None` if nothing fits.
@@ -31,26 +31,10 @@ pub fn select_csp(
             continue;
         }
         let d = dte(today, q.expiry);
-        if d < cfg.min_dte || d > cfg.max_dte {
-            continue;
-        }
-
-        let premium = q.mid();
-        if premium < cfg.min_premium {
-            continue;
-        }
-
-        if let Some(oi) = q.open_interest
-            && oi < cfg.min_open_interest {
-                continue;
-            }
-
-        let Some(abs_delta) = resolve_abs_delta(q, spot, d, cfg.risk_free_rate) else {
+        let Some(abs_delta) = passes_short_gates(q, spot, d, cfg) else {
             continue;
         };
-        if abs_delta < cfg.min_delta || abs_delta > cfg.max_delta {
-            continue;
-        }
+        let premium = q.mid();
 
         // Cash-secured sizing.
         let collateral_per_contract = q.strike * 100.0;
@@ -89,7 +73,7 @@ pub fn select_csp(
         };
 
         // Maximize yield, then prefer the strike whose delta is nearest target.
-        let score = ann - 0.001 * (abs_delta - cfg.target_delta).abs();
+        let score = entry_score(ann, abs_delta, cfg);
         if best.as_ref().is_none_or(|(b, _)| score > *b) {
             best = Some((score, suggestion));
         }
@@ -128,24 +112,10 @@ pub fn select_put_spread(
             continue;
         }
         let d = dte(today, short.expiry);
-        if d < cfg.min_dte || d > cfg.max_dte {
-            continue;
-        }
-        let short_premium = short.mid();
-        if short_premium < cfg.min_premium {
-            continue;
-        }
-        if let Some(oi) = short.open_interest
-            && oi < cfg.min_open_interest
-        {
-            continue;
-        }
-        let Some(abs_delta) = resolve_abs_delta(short, spot, d, cfg.risk_free_rate) else {
+        let Some(abs_delta) = passes_short_gates(short, spot, d, cfg) else {
             continue;
         };
-        if abs_delta < cfg.min_delta || abs_delta > cfg.max_delta {
-            continue;
-        }
+        let short_premium = short.mid();
 
         // Long leg: a cheaper put no more than `hedge_pct_below` under the short —
         // a *tight* hedge, never a far-away one that barely caps risk. Among those,
@@ -162,7 +132,7 @@ pub fn select_put_spread(
                     && q.mid() > 0.0
                     && q.mid() < short_premium
             })
-            .min_by(|a, b| a.strike.partial_cmp(&b.strike).unwrap_or(std::cmp::Ordering::Equal))
+            .min_by(|a, b| fcmp(&a.strike, &b.strike))
         else {
             continue; // no protective leg within the hedge cap from the sampled chain
         };
@@ -222,7 +192,7 @@ pub fn select_put_spread(
             ),
         };
         // Prefer yield, then the short delta nearest target (same as CSP scoring).
-        let score = ann - 0.001 * (abs_delta - cfg.target_delta).abs();
+        let score = entry_score(ann, abs_delta, cfg);
         if best.as_ref().is_none_or(|(b, _)| score > *b) {
             best = Some((score, suggestion));
         }
@@ -249,7 +219,6 @@ mod tests {
             delta: Some(-delta), // puts report negative delta
             implied_volatility: Some(0.3),
             open_interest: Some(500),
-            volume: Some(100),
         }
     }
 
