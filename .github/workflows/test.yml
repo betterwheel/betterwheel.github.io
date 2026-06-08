@@ -1,0 +1,66 @@
+name: Tests
+
+# Lint + test on EVERY push, every branch. The root `betterwheel` crate is the
+# tested code (engine / structures / positions / tui::app / store) and pulls in
+# NO GUI deps, so it builds on a bare Linux runner. The desktop crate (src-tauri)
+# links Tauri → webkit2gtk, so it gets its own compile-check job with the build
+# deps installed. Release binaries are built in release.yml and stay gated to
+# release/** branches; this workflow never builds a release.
+
+on:
+  push:
+
+env:
+  # Run JS actions (checkout, rust-cache) on Node 24 ahead of the default switch
+  # — silences the Node 20 deprecation notice.
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint-test:
+    name: clippy & test (lib + TUI)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # Lint is mandatory: any clippy (or rustc) warning fails the job, so nothing
+      # ships with a lint error. -D warnings applies to our crates, not deps.
+      - name: clippy (deny all warnings)
+        run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: test
+        run: cargo test
+
+  desktop-check:
+    name: cargo check (desktop)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      # The desktop crate links Tauri, which pulls in webkit2gtk/gtk at *build*
+      # time on Linux even though CI never opens a window. Install the dev libs so
+      # it compiles. (No libxdo here — BetterWheel simulates no global input.)
+      - name: Install Linux webview build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      # Compile-only gate (the heavyweight Tauri build is exercised for real in
+      # release.yml). Catches desktop-crate breakage on ordinary pushes/PRs.
+      - name: check
+        working-directory: src-tauri
+        run: cargo check --all-targets
