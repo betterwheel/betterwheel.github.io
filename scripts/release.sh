@@ -33,7 +33,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 # Releases live on this repo; it must be PUBLIC for the updater's anonymous fetch.
-RELEASES_REPO="betterwheel/betterwheel"
+RELEASES_REPO="betterwheel/betterwheel.github.io"
 UPDATER_KEY="${HOME}/.tauri/betterwheel-updater.key"
 SKIP_AUTHENTICODE="${SKIP_AUTHENTICODE:-1}"
 NOTES="${1:-BetterWheel desktop release}"

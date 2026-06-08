@@ -108,10 +108,11 @@ sibling `marie-lookapp`. Build-free static frontend (`dist/`, vanilla JS over
   so the desktop can transmit through the *same* guardrailed code.
 - **Auto-update** = `tauri-plugin-updater` (minisign, `native-tls` to dodge the
   cargo-xwin/`ring` cross-compile break). It checks `latest.json` on **this repo's**
-  GitHub Releases (`betterwheel/betterwheel`). The updater fetches anonymously, so **the
-  repo MUST be public** for auto-update to work — releases on a private repo can't be
-  downloaded without auth (it's currently private; auto-update goes live when it's
-  made public). `dist/update.js` drives check → download → `process.relaunch()`.
+  GitHub Releases (`betterwheel/betterwheel.github.io`). The updater fetches anonymously,
+  so **the repo MUST be public** for auto-update to work — releases on a private repo
+  can't be downloaded without auth (the repo is public, so auto-update works). This repo
+  doubles as the landing site (`betterwheel.github.io`, served from the root `index.html`).
+  `dist/update.js` drives check → download → `process.relaunch()`.
   macOS isn't notarized (right-click→Open first run) and uses no TCC permission, so
   the default ad-hoc signature is fine — the updater only verifies the **minisign**
   signature.
