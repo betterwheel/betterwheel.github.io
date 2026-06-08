@@ -1,0 +1,215 @@
+<!DOCTYPE html>
+<!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>BetterWheel — the options wheel, automated and safety-gated</title>
+    <meta
+      name="description"
+      content="A Rust TUI + desktop assistant for running the options wheel strategy and 0DTE index structures on Interactive Brokers. Paper-first, safety-gated, open source."
+    />
+    <link rel="stylesheet" href="style.css" />
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230d1117'/%3E%3Ccircle cx='16' cy='16' r='9' fill='none' stroke='%2333d18f' stroke-width='2.5'/%3E%3Ccircle cx='16' cy='16' r='2' fill='%2333d18f'/%3E%3C/svg%3E"
+    />
+  </head>
+  <body>
+    <header class="hero">
+      <nav class="nav">
+        <span class="wordmark">Better<span class="accent">Wheel</span></span>
+        <a class="ghost" href="https://github.com/betterwheel/betterwheel.github.io">GitHub ↗</a>
+      </nav>
+
+      <h1>The options <span class="accent">wheel</span>, automated&nbsp;— and safety-gated.</h1>
+      <p class="tagline">
+        A Rust terminal &amp; desktop assistant that runs the wheel strategy and
+        short-dated index structures on Interactive Brokers. It ranks the trades,
+        you approve them. Paper-first. Nothing transmits without a three-step gate.
+      </p>
+
+      <div class="cta">
+        <a class="btn primary" href="https://github.com/betterwheel/betterwheel.github.io/releases">Download</a>
+        <a class="btn" href="https://github.com/betterwheel/betterwheel.github.io">Read the source</a>
+      </div>
+
+      <p class="badges">
+        <span class="badge">Rust</span>
+        <span class="badge">Interactive Brokers · ibapi</span>
+        <span class="badge">Paper-first</span>
+        <span class="badge">AGPL-3.0</span>
+      </p>
+    </header>
+
+    <main>
+      <!-- WHAT IT IS ----------------------------------------------------- -->
+      <section>
+        <h2>What it does</h2>
+        <p class="lead">
+          BetterWheel connects to IB Gateway / TWS, reconciles your live positions
+          into wheel state, and ranks suggestions over live option chains: which
+          put to sell, which covered call to write, when to take profit or roll.
+          You always see a what-if preview and explicitly arm before anything is
+          sent. Offline, it falls back to consistent demo data so it's always usable.
+        </p>
+        <div class="grid two">
+          <div class="card">
+            <h3>Terminal UI</h3>
+            <p>
+              A <code>ratatui</code> app with a Suggestions tab and a 0DTE tab.
+              Pure render over app state; key-driven. The original and primary
+              front-end.
+            </p>
+          </div>
+          <div class="card">
+            <h3>Desktop app</h3>
+            <p>
+              A native Tauri dashboard with inline payoff charts and auto-update.
+              Same guardrailed core, a point-and-click face. Windows &amp; macOS.
+            </p>
+          </div>
+        </div>
+      </section>
+
+      <!-- THE WHEEL ------------------------------------------------------ -->
+      <section>
+        <h2>Strategy 1 — the wheel</h2>
+        <p class="lead">
+          Sell a cash-secured put for premium. If assigned, you own the stock at a
+          discount; write covered calls against it for income until it's called
+          away. Then repeat. BetterWheel automates the selection at every leg and
+          ranks <em>management before new entries</em>, then by annualized yield.
+        </p>
+
+        <div class="grid three">
+          <div class="card step">
+            <span class="num">1</span>
+            <h3>Cash-secured put</h3>
+            <p>The entry. Sell an OTM put, collect premium, stand ready to buy the shares at the strike.</p>
+          </div>
+          <div class="card step">
+            <span class="num">2</span>
+            <h3>Covered call</h3>
+            <p>Post-assignment income. Write calls against the assigned lot above your cost basis.</p>
+          </div>
+          <div class="card step">
+            <span class="num">3</span>
+            <h3>Manage</h3>
+            <p>Take-profit and roll. Close winners early; roll threatened legs to keep the wheel turning.</p>
+          </div>
+        </div>
+
+        <figure class="payoff">
+          <!-- Cash-secured put payoff at expiry -->
+          <svg viewBox="0 0 480 200" role="img" aria-label="Cash-secured put payoff at expiry">
+            <line class="axis" x1="20" y1="150" x2="460" y2="150" />
+            <line class="axis" x1="20" y1="20" x2="20" y2="180" />
+            <!-- breakeven / strike markers -->
+            <line class="grid" x1="300" y1="20" x2="300" y2="180" />
+            <text class="lbl" x="304" y="174">strike</text>
+            <!-- profit zone (capped premium) above strike -->
+            <path class="profit" d="M300,110 L460,110 L460,150 L300,150 Z" />
+            <!-- loss zone below breakeven -->
+            <path class="loss" d="M150,150 L210,150 L300,110 L150,180 Z" opacity="0.18" />
+            <!-- the payoff line -->
+            <path class="line" d="M120,180 L300,110 L460,110" />
+            <text class="cap" x="430" y="104">max profit = premium</text>
+            <text class="cap" x="118" y="176" text-anchor="start">assigned below</text>
+          </svg>
+          <figcaption>Cash-secured put — premium is capped; downside is owning the shares at the strike.</figcaption>
+        </figure>
+      </section>
+
+      <!-- 0DTE STRUCTURES ------------------------------------------------ -->
+      <section>
+        <h2>Strategy 2 — 0DTE index structures</h2>
+        <p class="lead">
+          A second, separate strategy family: short-dated, defined-risk structures
+          on cash-settled <strong>index</strong> options (SPX/SPXW). No assignment,
+          no shares — multi-leg combos that live and die intraday. A generic
+          piecewise-linear payoff engine derives risk, reward and breakevens for
+          any leg set. Surfaced on a dedicated 0DTE tab.
+        </p>
+
+        <div class="grid structures">
+          <div class="chip">Iron condor</div>
+          <div class="chip">Put credit spread</div>
+          <div class="chip">Call credit spread</div>
+          <div class="chip">Broken-wing fly</div>
+          <div class="chip">Iron fly</div>
+          <div class="chip">Short strangle <span class="muted">· gated</span></div>
+        </div>
+
+        <figure class="payoff">
+          <!-- Iron condor payoff -->
+          <svg viewBox="0 0 480 200" role="img" aria-label="Iron condor payoff at expiry">
+            <line class="axis" x1="20" y1="150" x2="460" y2="150" />
+            <line class="axis" x1="20" y1="20" x2="20" y2="180" />
+            <!-- plateau (max profit) and wings -->
+            <path class="profit" d="M170,110 L310,110 L310,150 L170,150 Z" />
+            <path class="line" d="M60,175 L170,110 L310,110 L420,175" />
+            <line class="grid" x1="120" y1="20" x2="120" y2="180" />
+            <line class="grid" x1="360" y1="20" x2="360" y2="180" />
+            <text class="cap" x="240" y="104" text-anchor="middle">max profit = net credit</text>
+            <text class="lbl" x="60" y="190" text-anchor="start">put wing</text>
+            <text class="lbl" x="420" y="190" text-anchor="end">call wing</text>
+          </svg>
+          <figcaption>Iron condor — collect the credit while price stays between the short strikes; the wings are the stop.</figcaption>
+        </figure>
+      </section>
+
+      <!-- SAFETY --------------------------------------------------------- -->
+      <section>
+        <h2>Safety model</h2>
+        <p class="lead">It is designed so a bug, a typo, or a bad fill can't quietly cost you money.</p>
+        <div class="grid two">
+          <div class="card safe">
+            <h3>Paper-first</h3>
+            <p>Defaults to the paper account (port 4002). Live trading is a deliberate switch, not the default.</p>
+          </div>
+          <div class="card safe">
+            <h3>Three-step transmit gate</h3>
+            <p>Preview (what-if) → <strong>arm</strong> → execute. A successful live submit auto-disarms immediately.</p>
+          </div>
+          <div class="card safe">
+            <h3>Guardrails</h3>
+            <p><code>read_only</code> blocks all transmits; caps on per-order size and total deployed collateral are enforced regardless of what the engine suggests.</p>
+          </div>
+          <div class="card safe">
+            <h3>0DTE automation is opt-in</h3>
+            <p>Auto-management is off by default, per slot, and still honors every guardrail. A loud banner shows whenever a slot is live.</p>
+          </div>
+        </div>
+      </section>
+
+      <!-- CONNECT -------------------------------------------------------- -->
+      <section class="closing">
+        <h2>How it connects</h2>
+        <p class="lead">
+          One boundary owns the broker: it maps IB data into plain structs, bounds
+          every streaming request with a timeout, and routes every order through a
+          single preview-or-submit entry point so the what-if and live paths can't
+          diverge. An incomplete snapshot is treated as <em>unknown</em> — never as
+          "your account is empty" — so a dropped connection can't wipe your state.
+        </p>
+        <div class="cta">
+          <a class="btn primary" href="https://github.com/betterwheel/betterwheel.github.io/releases">Get BetterWheel</a>
+          <a class="btn" href="https://github.com/betterwheel/betterwheel.github.io#readme">Documentation</a>
+        </div>
+      </section>
+    </main>
+
+    <footer>
+      <p>
+        <strong>BetterWheel</strong> is free software under the
+        <a href="https://github.com/betterwheel/betterwheel.github.io/blob/main/LICENSE">AGPL-3.0</a>.
+      </p>
+      <p class="disclaimer">
+        Educational tooling, <strong>not financial advice</strong>. Options trading
+        carries substantial risk of loss. Paper-trade first; you are responsible for
+        every order you arm and execute. No warranty of any kind.
+      </p>
+    </footer>
+  </body>
+</html>
