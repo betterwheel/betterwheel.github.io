@@ -118,3 +118,34 @@ table.mini td:first-child { color: #6b7787; }
 .tag.ok { background: #10331f; color: #4fd18a; }
 .tag.work { background: #2a2410; color: #e6c270; }
 .tag.bad { background: #33181a; color: #e07a7a; }
+
+/* ---- order controls (Phase 2) ---- */
+.controls {
+  display: flex; align-items: center; gap: 10px;
+  padding: 8px 12px; margin-bottom: 8px;
+  background: #0f141b; border: 1px solid #1d2733; border-radius: 8px;
+}
+.controls.is-armed { border-color: #b23b3b; box-shadow: 0 0 0 1px #b23b3b inset; }
+.mode { padding: 1px 8px; border-radius: 10px; font-size: 11px; text-transform: uppercase; letter-spacing: .5px; }
+.mode.paper { background: #16323f; color: #5bc0de; }
+.mode.live { background: #3a1620; color: #ff6b81; }
+button.armbtn { background: #1d2733; border: 1px solid #2a3645; }
+button.armbtn.on { background: #b23b3b; border-color: #d35; color: #fff; font-weight: 700; }
+.liveconf { display: inline-flex; align-items: center; gap: 6px; color: #e6c270; font-size: 13px; }
+.liveconf input {
+  width: 70px; font: inherit; background: #0d1117; color: #e6c270;
+  border: 1px solid #4a3a16; border-radius: 6px; padding: 3px 6px;
+}
+.autotag { color: #ff8a5b; font-weight: 700; font-size: 12px; }
+button.mini { font-size: 12px; padding: 2px 9px; }
+button.mini.exec { background: #16323f; border-color: #245; color: #cfe8f5; }
+button.mini.exec:not(:disabled):hover { background: #1d4a5e; }
+td.acts, .cardacts { white-space: nowrap; }
+td.acts button, .cardacts button { margin-left: 4px; }
+.cardacts { margin-top: 8px; display: flex; gap: 6px; }
+.statusline { padding: 4px 12px 8px; color: #9fb0c3; font-size: 13px; }
+.armbanner {
+  padding: 8px 12px; margin-bottom: 10px; border-radius: 8px;
+  background: #2a1012; border: 1px solid #b23b3b; color: #ffb3bd;
+  font-weight: 700; text-align: center; letter-spacing: .3px;
+}

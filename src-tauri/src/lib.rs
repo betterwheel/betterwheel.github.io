@@ -1,9 +1,10 @@
-//! BetterWheel desktop (Tauri) — a native front-end over the shared `betterwheel` core.
-//!
-//! Phase 1 is **read-only**: a background task drives `betterwheel::data::gather`
-//! (connected) or the demo chains (offline), caches a render-ready [`Snapshot`],
-//! and emits it to the webview. No order transmit lives here — the arm/execute
-//! safety flow stays in the TUI and lands in Phase 2.
+//! BetterWheel desktop (Tauri) — a native front-end over the shared `betterwheel`
+//! core. It **drives the same `tui::app::App`** the terminal UI runs: a background
+//! task wires the broker order-event stream, the 0DTE scheduler, reloads, and
+//! reconnect/health into `App`, and the webview renders a snapshot of its state.
+//! The preview→arm→execute→live-confirm safety flow goes through `App`'s exact,
+//! deep-review-hardened guardrail code (via the `ui_*` facade) — nothing about the
+//! order path is reimplemented here.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -12,19 +13,22 @@ use std::time::Duration;
 use chrono::Local;
 use serde::Serialize;
 use tauri::{Emitter, Manager};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::Mutex;
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 
-use betterwheel::config::Config;
-use betterwheel::data::gather;
+use betterwheel::config::{Config, ConnectionConfig};
 use betterwheel::engine::structures;
 use betterwheel::engine::types::{ActionKind, StructureLeg, Suggestion};
-use betterwheel::ibkr::{AccountSnapshot, Ibkr};
+use betterwheel::ibkr::{AccountSnapshot, Ibkr, OrderEvent};
 use betterwheel::store::{JournalRow, Store, WheelPositionRow};
-use betterwheel::tui::demo;
+use betterwheel::tui::app::{App, BrokerUpdate, SugList};
 
-const REFRESH_SECS: u64 = 30;
 const RECONNECT_SECS: u64 = 15;
 const HEALTH_SECS: u64 = 5;
+const SCHEDULER_SECS: u64 = 30;
+const AUTORELOAD_SECS: u64 = 180;
+const HEARTBEAT_SECS: u64 = 3;
 const CONNECT_TIMEOUT_SECS: u64 = 5;
 
 // ---- render-ready view structs (Serialize → the webview) ----
@@ -62,7 +66,7 @@ struct JournalView {
 
 /// A suggestion flattened for the webview: a ready display label + the scalar
 /// fields the tables/cards show (so the frontend never parses the `ActionKind`
-/// enum shape).
+/// enum shape). Its array position is its command index.
 #[derive(Serialize, Clone)]
 struct SuggestionView {
     symbol: String,
@@ -113,25 +117,21 @@ struct SlotView {
 #[derive(Serialize, Clone, Default)]
 struct Snapshot {
     connected: bool,
+    mode: String,
+    armed: bool,
+    live_confirmed: bool,
+    needs_live_confirm: bool,
+    auto_trading: usize,
     account: Option<AccountView>,
     suggestions: Vec<SuggestionView>,
     hedged: Vec<SuggestionView>,
     zerodte: Vec<SlotView>,
     positions: Vec<PositionView>,
     journal: Vec<JournalView>,
+    status: String,
     updated: String,
     note: String,
 }
-
-struct AppState {
-    cfg: Config,
-    ibkr: Mutex<Option<Arc<Ibkr>>>,
-    store: Store,
-    snapshot: RwLock<Snapshot>,
-}
-type Shared = Arc<AppState>;
-
-// ---- data assembly (mirrors the TUI's read-only refresh) ----
 
 /// Sample a structure's expiry P&L (total $ for `qty` contracts) across a price
 /// range spanning its strikes — the series the webview plots. Returns `(xs, ys)`.
@@ -213,123 +213,286 @@ fn jrn_view(j: &JournalRow) -> JournalView {
     }
 }
 
-/// Build the snapshot from the broker (connected) or demo data (offline). The
-/// connected path uses `gather`, which is read-only — it syncs wheel state and
-/// ranks suggestions but never transmits or reconciles orders.
-async fn build_snapshot(st: &AppState) -> Snapshot {
-    let today = Local::now().date_naive();
-    let updated = Local::now().format("%H:%M:%S").to_string();
-    let ibkr = st.ibkr.lock().await.clone();
-
-    if let Some(ibkr) = ibkr {
-        let d = gather(&ibkr, &st.store, &st.cfg, &[], today).await;
-        let ok = d.positions_ok;
-        Snapshot {
-            connected: true,
-            account: d.account.as_ref().map(AccountView::from),
-            suggestions: if ok { d.suggestions.iter().map(sug_view).collect() } else { Vec::new() },
-            hedged: if ok { d.hedged_suggestions.iter().map(sug_view).collect() } else { Vec::new() },
-            zerodte: slot_views(&st.cfg, if ok { &d.zerodte_suggestions } else { &[] }),
-            positions: d.positions.iter().filter(|p| p.state != "Idle").map(pos_view).collect(),
-            journal: d.journal.iter().map(jrn_view).collect(),
-            updated,
-            note: if ok {
-                String::new()
-            } else {
-                "broker positions unavailable — suggestions hidden until the next refresh".into()
-            },
-        }
-    } else {
-        let watch = st.store.list_watchlist().await.unwrap_or_default();
-        let symbols: Vec<String> =
-            watch.iter().filter(|w| w.is_enabled()).map(|w| w.symbol.clone()).collect();
-        let zsug = demo::demo_zerodte(&st.cfg.zerodte, &st.cfg.engine, today);
-        let positions = st.store.list_positions().await.unwrap_or_default();
-        let journal = st.store.recent_journal(200).await.unwrap_or_default();
-        Snapshot {
-            connected: false,
-            account: None,
-            suggestions: demo::demo_suggestions(&symbols, &st.cfg.engine, today)
-                .iter()
-                .map(sug_view)
-                .collect(),
-            hedged: Vec::new(),
-            zerodte: slot_views(&st.cfg, &zsug),
-            positions: positions.iter().filter(|p| p.state != "Idle").map(pos_view).collect(),
-            journal: journal.iter().map(jrn_view).collect(),
-            updated,
-            note: "offline — showing demo data (start IB Gateway to go live)".into(),
-        }
+/// A render-ready snapshot of the live `App` state (pure read; no I/O).
+fn build_snapshot(app: &App) -> Snapshot {
+    Snapshot {
+        connected: app.connected,
+        mode: app.mode_label().to_string(),
+        armed: app.armed,
+        live_confirmed: app.live_confirmed,
+        needs_live_confirm: !app.live_gate_ok(),
+        auto_trading: app.zerodte_automating(),
+        account: app.account.as_ref().map(AccountView::from),
+        suggestions: app.suggestions.iter().map(sug_view).collect(),
+        hedged: app.hedged_suggestions.iter().map(sug_view).collect(),
+        zerodte: slot_views(&app.cfg, &app.zerodte_suggestions),
+        positions: app.positions.iter().filter(|p| p.state != "Idle").map(pos_view).collect(),
+        journal: app.journal.iter().map(jrn_view).collect(),
+        status: app.status.clone(),
+        updated: Local::now().format("%H:%M:%S").to_string(),
+        note: if app.connected {
+            String::new()
+        } else {
+            app.offline_reason
+                .clone()
+                .unwrap_or_else(|| "offline — showing demo data (start IB Gateway to go live)".into())
+        },
     }
 }
 
-async fn try_connect(st: &AppState) -> bool {
-    match tokio::time::timeout(
-        Duration::from_secs(CONNECT_TIMEOUT_SECS),
-        Ibkr::connect(&st.cfg.connection),
-    )
-    .await
-    {
-        Ok(Ok(ib)) => {
-            tracing::info!("connected to IB Gateway");
-            *st.ibkr.lock().await = Some(Arc::new(ib));
-            true
-        }
-        Ok(Err(e)) => {
-            tracing::warn!("Gateway connect failed: {e}");
-            false
-        }
-        Err(_) => {
-            tracing::warn!("Gateway connect timed out");
-            false
-        }
+/// Shared server state: the live `App` (behind a lock) and the store handle.
+struct DeskState {
+    app: Mutex<App>,
+    store: Store,
+}
+type Shared = Arc<DeskState>;
+
+/// Build a snapshot under the lock, then emit it to the webview (lock released
+/// before the emit). The single place the frontend is notified of state changes.
+async fn emit(app_handle: &tauri::AppHandle, st: &DeskState) -> Snapshot {
+    let snap = {
+        let app = st.app.lock().await;
+        build_snapshot(&app)
+    };
+    let _ = app_handle.emit("snapshot", &snap);
+    snap
+}
+
+// ---- the broker background driver (mirrors `tui::mod::run`, minus the terminal) ----
+
+fn spawn_order_consumer(
+    ibkr: Option<Arc<Ibkr>>,
+    tx: &mpsc::UnboundedSender<OrderEvent>,
+) -> Option<JoinHandle<()>> {
+    ibkr.map(|ib| {
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            let _ = ib.stream_order_events(tx).await;
+        })
+    })
+}
+
+fn spawn_reconnect(
+    conn: ConnectionConfig,
+    tx: &mpsc::UnboundedSender<BrokerUpdate>,
+) -> Option<JoinHandle<()>> {
+    if conn.reconnect_secs == 0 {
+        return None;
     }
+    let tx = tx.clone();
+    Some(tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(conn.reconnect_secs)).await;
+            if tx.is_closed() {
+                return;
+            }
+            match tokio::time::timeout(Duration::from_secs(CONNECT_TIMEOUT_SECS), Ibkr::connect(&conn)).await {
+                Ok(Ok(ib)) => {
+                    let _ = tx.send(BrokerUpdate::Connected(Arc::new(ib)));
+                    return;
+                }
+                Ok(Err(e)) => {
+                    let _ = tx.send(BrokerUpdate::ConnectFailed(betterwheel::ibkr::connect_failure_hint(&e)));
+                }
+                Err(_) => {
+                    let _ = tx.send(BrokerUpdate::ConnectFailed(
+                        "IB Gateway connection timed out — is it running?".into(),
+                    ));
+                }
+            }
+        }
+    }))
 }
 
-async fn do_refresh(app: &tauri::AppHandle, st: &AppState) {
-    let snap = build_snapshot(st).await;
-    *st.snapshot.write().await = snap.clone();
-    let _ = app.emit("snapshot", &snap);
-}
+/// Drive the `App`: fan in broker order events, off-loop reloads, the 0DTE
+/// scheduler, reconnect, and a health poll — emitting a fresh snapshot after each.
+async fn run_loop(app_handle: tauri::AppHandle, st: Shared) {
+    let (upd_tx, mut upd_rx) = mpsc::unbounded_channel();
+    let (order_tx, mut order_rx) = mpsc::unbounded_channel();
 
-/// The read-only background driver: initial connect + refresh, then periodic
-/// refresh, reconnect-while-offline, and a health poll that drops a dead socket.
-async fn run_background(app: tauri::AppHandle, st: Shared) {
-    try_connect(&st).await;
-    do_refresh(&app, &st).await;
+    let (mut order_consumer, mut reconnect) = {
+        let mut app = st.app.lock().await;
+        app.set_update_sender(upd_tx.clone());
+        let oc = spawn_order_consumer(app.ibkr.clone(), &order_tx);
+        let rc = if app.ibkr.is_none() {
+            spawn_reconnect(app.cfg.connection.clone(), &upd_tx)
+        } else {
+            None
+        };
+        // Kick the first live load (off-loop) so suggestions populate.
+        if app.ibkr.is_some() {
+            app.request_reload(&st.store).await;
+        }
+        (oc, rc)
+    };
+    emit(&app_handle, &st).await;
 
-    let mut refresh_iv = tokio::time::interval(Duration::from_secs(REFRESH_SECS));
+    let mut heartbeat = tokio::time::interval(Duration::from_secs(HEARTBEAT_SECS));
+    let mut health = tokio::time::interval(Duration::from_secs(HEALTH_SECS));
+    let mut scheduler = tokio::time::interval(Duration::from_secs(SCHEDULER_SECS));
+    let mut autoreload = tokio::time::interval(Duration::from_secs(AUTORELOAD_SECS));
     let mut reconnect_iv = tokio::time::interval(Duration::from_secs(RECONNECT_SECS));
-    let mut health_iv = tokio::time::interval(Duration::from_secs(HEALTH_SECS));
-    // Consume each interval's immediate first tick so the loop ticks are spaced
-    // (we already did the initial connect + refresh above).
-    refresh_iv.tick().await;
+    heartbeat.tick().await;
+    health.tick().await;
+    scheduler.tick().await;
+    autoreload.tick().await;
     reconnect_iv.tick().await;
-    health_iv.tick().await;
 
     loop {
         tokio::select! {
-            _ = refresh_iv.tick() => do_refresh(&app, &st).await,
-            _ = reconnect_iv.tick() => {
-                let connected = st.ibkr.lock().await.is_some();
-                if !connected && try_connect(&st).await {
-                    do_refresh(&app, &st).await;
+            Some(ev) = order_rx.recv() => {
+                let _ = st.app.lock().await.apply_order_event(ev, &st.store).await;
+                emit(&app_handle, &st).await;
+            }
+            Some(upd) = upd_rx.recv() => {
+                {
+                    let mut app = st.app.lock().await;
+                    match upd {
+                        BrokerUpdate::Connected(ib) => {
+                            if let Some(h) = order_consumer.take() { h.abort(); }
+                            app.set_connected(ib);
+                            order_consumer = spawn_order_consumer(app.ibkr.clone(), &order_tx);
+                            reconnect = None;
+                            app.request_reload(&st.store).await;
+                        }
+                        BrokerUpdate::ConnectFailed(reason) => app.set_offline_reason(reason),
+                        BrokerUpdate::Reloaded(data) => app.apply_live_data(*data, &st.store).await,
+                    }
+                }
+                emit(&app_handle, &st).await;
+            }
+            _ = health.tick() => {
+                let restart = {
+                    let mut app = st.app.lock().await;
+                    let dropped = app.connected
+                        && app.ibkr.as_ref().is_some_and(|ib| !ib.is_connected());
+                    if dropped {
+                        app.set_disconnected("IB Gateway connection lost — reconnecting…".into());
+                        Some(app.cfg.connection.clone())
+                    } else {
+                        None
+                    }
+                };
+                if let Some(conn) = restart {
+                    if let Some(h) = order_consumer.take() { h.abort(); }
+                    if let Some(h) = reconnect.take() { h.abort(); }
+                    reconnect = spawn_reconnect(conn, &upd_tx);
+                    emit(&app_handle, &st).await;
                 }
             }
-            _ = health_iv.tick() => {
-                let mut guard = st.ibkr.lock().await;
-                if guard.as_ref().is_some_and(|ib| !ib.is_connected()) {
-                    tracing::warn!("IB Gateway connection lost — will reconnect");
-                    *guard = None;
+            _ = reconnect_iv.tick() => {
+                // Belt-and-suspenders: if offline and no reconnect task is running, start one.
+                let need = {
+                    let app = st.app.lock().await;
+                    app.ibkr.is_none()
+                };
+                if need && reconnect.is_none() {
+                    let conn = st.app.lock().await.cfg.connection.clone();
+                    reconnect = spawn_reconnect(conn, &upd_tx);
                 }
+            }
+            _ = scheduler.tick() => {
+                st.app.lock().await.tick_zerodte(&st.store).await;
+                emit(&app_handle, &st).await;
+            }
+            _ = autoreload.tick() => {
+                let mut app = st.app.lock().await;
+                if app.ibkr.is_some() {
+                    app.request_reload(&st.store).await;
+                }
+            }
+            _ = heartbeat.tick() => {
+                // Periodic emit so the "updated" clock advances and a landed reload shows.
+                emit(&app_handle, &st).await;
             }
         }
+    }
+}
+
+// ---- Tauri commands ----
+
+fn parse_list(s: &str) -> Result<SugList, String> {
+    match s {
+        "classic" => Ok(SugList::Classic),
+        "hedged" => Ok(SugList::Hedged),
+        "zerodte" => Ok(SugList::ZeroDte),
+        other => Err(format!("unknown list {other}")),
     }
 }
 
 #[tauri::command]
 async fn get_snapshot(state: tauri::State<'_, Shared>) -> Result<Snapshot, String> {
-    Ok(state.snapshot.read().await.clone())
+    Ok(build_snapshot(&*state.app.lock().await))
+}
+
+#[tauri::command]
+async fn preview(
+    list: String,
+    index: usize,
+    app_handle: tauri::AppHandle,
+    state: tauri::State<'_, Shared>,
+) -> Result<Snapshot, String> {
+    let sl = parse_list(&list)?;
+    state.app.lock().await.ui_preview(sl, index, &state.store).await.map_err(|e| e.to_string())?;
+    Ok(emit(&app_handle, &state).await)
+}
+
+#[tauri::command]
+async fn execute(
+    list: String,
+    index: usize,
+    app_handle: tauri::AppHandle,
+    state: tauri::State<'_, Shared>,
+) -> Result<Snapshot, String> {
+    let sl = parse_list(&list)?;
+    state.app.lock().await.ui_execute(sl, index, &state.store).await.map_err(|e| e.to_string())?;
+    Ok(emit(&app_handle, &state).await)
+}
+
+#[tauri::command]
+async fn set_armed(
+    on: bool,
+    app_handle: tauri::AppHandle,
+    state: tauri::State<'_, Shared>,
+) -> Result<Snapshot, String> {
+    state.app.lock().await.ui_set_armed(on);
+    Ok(emit(&app_handle, &state).await)
+}
+
+#[tauri::command]
+async fn confirm_live(
+    phrase: String,
+    app_handle: tauri::AppHandle,
+    state: tauri::State<'_, Shared>,
+) -> Result<Snapshot, String> {
+    state.app.lock().await.ui_confirm_live(&phrase);
+    Ok(emit(&app_handle, &state).await)
+}
+
+#[tauri::command]
+async fn refresh(
+    app_handle: tauri::AppHandle,
+    state: tauri::State<'_, Shared>,
+) -> Result<Snapshot, String> {
+    state.app.lock().await.request_reload(&state.store).await;
+    Ok(emit(&app_handle, &state).await)
+}
+
+async fn try_connect(cfg: &Config) -> Option<Arc<Ibkr>> {
+    match tokio::time::timeout(Duration::from_secs(CONNECT_TIMEOUT_SECS), Ibkr::connect(&cfg.connection)).await {
+        Ok(Ok(ib)) => {
+            tracing::info!("connected to IB Gateway");
+            Some(Arc::new(ib))
+        }
+        Ok(Err(e)) => {
+            tracing::warn!("Gateway connect failed: {e}");
+            None
+        }
+        Err(_) => {
+            tracing::warn!("Gateway connect timed out");
+            None
+        }
+    }
 }
 
 pub fn run() {
@@ -343,14 +506,14 @@ pub fn run() {
     let cfg = Config::load(Path::new("config.toml")).unwrap_or_default();
     let data_dir = cfg.resolved_data_dir();
     std::fs::create_dir_all(&data_dir).ok();
-    let store = tauri::async_runtime::block_on(Store::open(&data_dir.join("betterwheel.db")))
-        .expect("open store");
-    let state: Shared = Arc::new(AppState {
-        cfg,
-        ibkr: Mutex::new(None),
-        store,
-        snapshot: RwLock::new(Snapshot::default()),
+
+    let (app, store) = tauri::async_runtime::block_on(async {
+        let store = Store::open(&data_dir.join("betterwheel.db")).await.expect("open store");
+        let ibkr = try_connect(&cfg).await;
+        let app = App::new(cfg, ibkr, &store).await.expect("init app");
+        (app, store)
     });
+    let state: Shared = Arc::new(DeskState { app: Mutex::new(app), store });
 
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
@@ -363,11 +526,18 @@ pub fn run() {
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_dialog::init())
         .manage(state)
-        .invoke_handler(tauri::generate_handler![get_snapshot])
+        .invoke_handler(tauri::generate_handler![
+            get_snapshot,
+            preview,
+            execute,
+            set_armed,
+            confirm_live,
+            refresh
+        ])
         .setup(|app| {
             let handle = app.handle().clone();
             let st = app.state::<Shared>().inner().clone();
-            tauri::async_runtime::spawn(run_background(handle, st));
+            tauri::async_runtime::spawn(run_loop(handle, st));
             Ok(())
         })
         .run(tauri::generate_context!())
