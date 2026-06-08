@@ -55,7 +55,7 @@ for f in "$@"; do
     --tsaurl http://timestamp.acs.microsoft.com \
     --tsmode RFC3161 \
     --name "BetterWheel" \
-    --url "https://github.com/betterwheel/betterwheel" \
+    --url "https://github.com/betterwheel/betterwheel.github.io" \
     --replace \
     "${f}"
   if command -v osslsigncode >/dev/null 2>&1; then
