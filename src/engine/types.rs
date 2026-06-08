@@ -138,7 +138,7 @@ pub struct SharePosition {
 }
 
 /// Which way a single structure leg trades.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum LegSide {
     Buy,
     Sell,
@@ -146,7 +146,7 @@ pub enum LegSide {
 
 /// One leg of a multi-leg structure (iron condor, butterfly, …). Plain data; the
 /// IBKR layer maps these into combo (BAG) legs at order time.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 pub struct StructureLeg {
     pub right: Right,
     pub strike: f64,
@@ -210,7 +210,7 @@ impl StructureKind {
 }
 
 /// The action the engine recommends.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub enum ActionKind {
     /// Open a cash-secured put.
     SellPut,
@@ -262,7 +262,7 @@ impl ActionKind {
 }
 
 /// A single recommended action with everything needed to preview/execute it.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Suggestion {
     pub symbol: String,
     pub kind: ActionKind,

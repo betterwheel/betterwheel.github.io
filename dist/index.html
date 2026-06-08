@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>BetterWheel</title>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <header class="top">
+      <span class="brand">▮▮ BetterWheel</span>
+      <span class="sub">desktop</span>
+      <span class="spacer"></span>
+      <div id="update-banner" class="update hidden">
+        <span id="update-text"></span>
+        <button id="update-install">Install &amp; restart</button>
+        <button id="update-later" class="ghost">Later</button>
+      </div>
+      <button id="check-updates" class="ghost">Check for updates</button>
+      <span id="app-version" class="ver"></span>
+    </header>
+    <main id="app"><div class="empty">Loading…</div></main>
+    <script src="app.js" defer></script>
+    <script src="update.js" defer></script>
+  </body>
+</html>

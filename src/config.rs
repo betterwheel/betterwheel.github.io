@@ -353,7 +353,7 @@ impl Config {
         self.data_dir.clone().unwrap_or_else(|| {
             dirs::data_dir()
                 .unwrap_or_else(|| PathBuf::from("."))
-                .join("thewheel")
+                .join("betterwheel")
         })
     }
 }

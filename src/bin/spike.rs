@@ -12,9 +12,9 @@ use anyhow::Result;
 use chrono::{Local, NaiveDate};
 use std::path::Path;
 
-use thewheel::config::Config;
-use thewheel::engine::math::fcmp;
-use thewheel::ibkr::{Ibkr, Tradability};
+use betterwheel::config::Config;
+use betterwheel::engine::math::fcmp;
+use betterwheel::ibkr::{Ibkr, Tradability};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -24,7 +24,7 @@ async fn main() -> Result<()> {
     let cfg = Config::load(Path::new("config.toml"))?;
     let addr = cfg.connection.address();
 
-    println!("== TheWheel spike ==");
+    println!("== BetterWheel spike ==");
     println!("symbol: {symbol}");
     println!("connecting to IB Gateway at {addr} (mode {:?}, market data {:?}) ...\n",
         cfg.connection.mode, cfg.connection.market_data);

@@ -1,4 +1,4 @@
-//! TheWheel — launches the terminal UI.
+//! BetterWheel — launches the terminal UI.
 //!
 //! Logs go to a file (never stdout) so they can't corrupt the alternate screen.
 //! Tries to connect to IB Gateway at startup with a short timeout; on failure
@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
-use thewheel::{config::Config, ibkr::Ibkr, store::Store, tui};
+use betterwheel::{config::Config, ibkr::Ibkr, store::Store, tui};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -20,7 +20,7 @@ async fn main() -> Result<()> {
     // Keep the guard alive for the program's lifetime so logs flush.
     let _log_guard = init_logging(&data_dir);
 
-    let store = Store::open(&data_dir.join("thewheel.db")).await?;
+    let store = Store::open(&data_dir.join("betterwheel.db")).await?;
     let (ibkr, offline_reason) = try_connect_ibkr(&cfg).await;
 
     let terminal = ratatui::init();
@@ -28,7 +28,7 @@ async fn main() -> Result<()> {
     ratatui::restore();
 
     if let Err(e) = &result {
-        eprintln!("thewheel error: {e:#}");
+        eprintln!("betterwheel error: {e:#}");
     }
     result
 }
@@ -44,7 +44,7 @@ async fn try_connect_ibkr(cfg: &Config) -> (Option<Arc<Ibkr>>, Option<String>) {
         }
         Ok(Err(e)) => {
             tracing::warn!("Gateway connect to {addr} failed: {e}; running offline");
-            (None, Some(thewheel::ibkr::connect_failure_hint(&e)))
+            (None, Some(betterwheel::ibkr::connect_failure_hint(&e)))
         }
         Err(_) => {
             tracing::warn!("Gateway connect to {addr} timed out; running offline");
@@ -57,7 +57,7 @@ async fn try_connect_ibkr(cfg: &Config) -> (Option<Arc<Ibkr>>, Option<String>) {
 fn init_logging(data_dir: &Path) -> Option<tracing_appender::non_blocking::WorkerGuard> {
     let log_dir = data_dir.join("logs");
     std::fs::create_dir_all(&log_dir).ok()?;
-    let appender = tracing_appender::rolling::never(&log_dir, "thewheel.log");
+    let appender = tracing_appender::rolling::never(&log_dir, "betterwheel.log");
     let (writer, guard) = tracing_appender::non_blocking(appender);
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));

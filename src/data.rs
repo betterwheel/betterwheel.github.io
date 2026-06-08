@@ -1,9 +1,10 @@
-//! Live broker + engine data pipeline.
+//! Live broker + engine data pipeline — the UI-agnostic data layer.
 //!
-//! This is where the TUI's data-gathering lives, kept out of the [`super::app`]
-//! state machine: turning IBKR market data and holdings into ranked
+//! Sits between the broker/store/engine and the front-ends ([`crate::tui`] and
+//! [`crate::web`]): turning IBKR market data and holdings into ranked
 //! [`Suggestion`]s, syncing broker positions into the wheel-state store, probing
-//! tradability, and resolving roll targets. No UI state — all free functions.
+//! tradability, and resolving roll targets. No UI state — all free functions, so
+//! either UI can drive it.
 
 use anyhow::Result;
 use chrono::NaiveDate;
@@ -49,7 +50,7 @@ const STRUCTURE_SNAPSHOT_CHUNK: usize = 16;
 /// single connected-reload pipeline — the heavy broker I/O (chains, snapshots,
 /// the tradability probe) never runs on the UI thread, and `App::reload`'s
 /// synchronous fallback delegates here too rather than duplicating it.
-pub(super) struct LiveData {
+pub struct LiveData {
     pub account: Option<AccountSnapshot>,
     pub watchlist: Vec<WatchlistRow>,
     pub journal: Vec<JournalRow>,
@@ -73,7 +74,7 @@ pub(super) struct LiveData {
 /// `pending_roll_symbols` are folded into the "skip" set so a symbol with an
 /// in-flight roll never gets a stacked suggestion. Pending-roll *reconciliation*
 /// (stateful, can transmit) stays on the event loop in `App::apply_live_data`.
-pub(super) async fn gather(
+pub async fn gather(
     ibkr: &Ibkr,
     store: &Store,
     cfg: &Config,
@@ -147,7 +148,7 @@ pub(super) async fn gather(
 /// a freshly-fetched both-sides index chain at the slot's target DTE. Slots are
 /// fetched sequentially (each fans its strike snapshots out concurrently) to keep
 /// the simultaneous market-data line count bounded.
-pub(super) async fn structure_suggestions(
+pub(crate) async fn structure_suggestions(
     ibkr: &Ibkr,
     zerodte: &ZeroDteConfig,
     risk_free_rate: f64,
@@ -279,7 +280,7 @@ fn quote_from_snapshot(
 
 /// One-shot price for an option leg (used to value a roll's new leg): model
 /// price if present, else last, rounded to the cent. `None` if unpriced.
-pub(super) async fn price_leg(ibkr: &Ibkr, symbol: &str, expiry: &str, strike: f64, right: &str) -> Option<f64> {
+pub(crate) async fn price_leg(ibkr: &Ibkr, symbol: &str, expiry: &str, strike: f64, right: &str) -> Option<f64> {
     let snap = ibkr.option_snapshot(symbol, expiry, strike, right).await.ok()?;
     let price = snap.comp.as_ref().and_then(|c| c.option_price).or(snap.last)?;
     (price > 0.0).then(|| round_cents(price))
@@ -290,7 +291,7 @@ pub(super) async fn price_leg(ibkr: &Ibkr, symbol: &str, expiry: &str, strike: f
 /// Every symbol that has a current holding *or* an already-tracked row is
 /// re-derived (so a closed position falls back to `Idle`), preserving each
 /// row's `cumulative_premium` (which the broker can't report).
-pub(super) async fn sync_wheel_state(store: &Store, broker_positions: &[PositionRow]) {
+pub(crate) async fn sync_wheel_state(store: &Store, broker_positions: &[PositionRow]) {
     use std::collections::BTreeSet;
     let mut symbols: BTreeSet<String> =
         broker_positions.iter().map(|p| p.symbol.clone()).collect();
@@ -313,7 +314,7 @@ pub(super) async fn sync_wheel_state(store: &Store, broker_positions: &[Position
 /// whose status is still unknown, persisting Allowed/Blocked. One-shot per
 /// symbol: once set it isn't re-probed, so the cost is paid once. Uses a far-OTM
 /// put what-if (never transmitted), mirroring the spike's probe.
-pub(super) async fn probe_unknown_tradability(
+pub(crate) async fn probe_unknown_tradability(
     ibkr: &Ibkr,
     store: &Store,
     watchlist: &[WatchlistRow],
@@ -428,7 +429,7 @@ fn nearest_strike(strikes: &[f64], target: f64) -> Option<f64> {
 /// DTE, nearest listed strike, and its current credit. `None` if the chain is
 /// empty or the leg can't be priced. Without this, the target often falls on a
 /// non-trading date and the order would reference a nonexistent contract.
-pub(super) async fn resolve_roll_target(
+pub(crate) async fn resolve_roll_target(
     ibkr: &Ibkr,
     symbol: &str,
     right: &str,
@@ -469,7 +470,7 @@ struct SymbolInputs {
 
 /// Compute suggestions across the enabled watchlist using live data, with each
 /// symbol advised in the wheel leg its holdings put it in.
-pub(super) async fn live_suggestions(
+pub(crate) async fn live_suggestions(
     ibkr: &Ibkr,
     store: &Store,
     watchlist: &[WatchlistRow],
@@ -731,7 +732,7 @@ async fn gather_manage_inputs(
 /// Whether broker `positions` still hold a *short* option matching this leg.
 /// `right` is an IBKR code (`"P"`/`"C"`); IBKR may report `right` as `PUT`/`CALL`
 /// too, so we match on the leading letter.
-pub(super) fn position_has_short(
+pub(crate) fn position_has_short(
     positions: &[PositionRow],
     symbol: &str,
     right: &str,
