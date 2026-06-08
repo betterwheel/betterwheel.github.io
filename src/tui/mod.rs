@@ -7,7 +7,6 @@
 
 pub mod app;
 pub mod demo;
-mod live;
 mod schedule;
 pub mod ui;
 

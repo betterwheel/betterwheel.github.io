@@ -1,4 +1,4 @@
-# TheWheel
+# BetterWheel
 
 Rust TUI assistant for running the options **wheel strategy** on Interactive
 Brokers. Connects to IB Gateway/TWS via the `ibapi` crate; persists local state
@@ -12,6 +12,11 @@ cargo test                       # unit tests live next to the code (#[cfg(test)
 cargo clippy --all-targets
 cargo run                        # launch the TUI (reads ./config.toml)
 cargo run --bin spike -- AAPL    # read-only Gateway connectivity probe (default AAPL)
+
+# Desktop app (Tauri) — an additional front-end; the TUI is unchanged.
+npm install                      # one-time: fetch the Tauri CLI
+npm run dev                      # launch the desktop dashboard (reads ./config.toml)
+scripts/release.sh "notes…"      # build + minisign + publish a desktop release (updater feed)
 ```
 
 Edition 2024; no pinned toolchain. Tests are pure and need no Gateway/network
@@ -47,12 +52,23 @@ backs store tests.
   (auto-managed structures), `zerodte_settings` (in-app slot overrides); see
   `migrations/`). Migrations run automatically on `Store::open`. Holds the wheel
   metadata IBKR can't report (which leg, cost basis, cumulative premium).
+- `data.rs` — **the UI-agnostic live-data layer** (free functions, no UI state).
+  Turns IBKR market data + holdings into ranked `Suggestion`s, syncs broker
+  positions into the store, probes tradability, resolves roll targets. `gather()`
+  is the one connected-reload pipeline any front-end drives.
 - `tui/` — `ratatui` app. `app.rs` = state + key→`Action` dispatch (async work),
   `ui.rs` = **pure render function of `App`**, `mod.rs` = `tokio::select!` run
   loop (key events + broker order-event stream + redraw + a 30s 0DTE scheduler
   tick), `schedule.rs` = **pure** US/Eastern market-time + entry-timing helpers.
 - `config.rs` — TOML config (connection, engine tuning, guardrails); every field
   defaults, so a missing `config.toml` still runs. See `config.toml.example`.
+- `src-tauri/` + `dist/` — the **desktop app** (a separate `betterwheel-desktop`
+  crate that path-deps the lib). `src-tauri/src/lib.rs` runs a background task that
+  drives `data::gather` (or demo) and emits a cached snapshot; `dist/` is a
+  build-free static frontend (vanilla JS over `window.__TAURI__`, inline-SVG payoff
+  charts). **Phase 1 is read-only** — no order transmit (the arm/execute flow stays
+  in the TUI; Phase 2 will extract a shared `Session` core for it). See the desktop
+  section below.
 
 Data flow when connected: `ibkr.positions()` → `positions::reconcile` → sync into
 `store` → `engine::plan` over live chains → suggestions.
@@ -78,9 +94,41 @@ Data flow when connected: `ibkr.positions()` → `positions::reconcile` → sync
   separate stop order for defined-risk structures). A loud "⚡ AUTO-TRADING" header
   banner shows whenever a slot is live. **Default off** — do not weaken this gate.
 
+## Desktop app (Tauri) & auto-update
+
+The `betterwheel-desktop` crate (`src-tauri/`) is a native dashboard, modeled on the
+sibling `marie-lookapp`. Build-free static frontend (`dist/`, vanilla JS over
+`window.__TAURI__`, `withGlobalTauri`); strict CSP; payoff curves are inline SVG
+(no chart lib). The lib stays clean — all Tauri/webview deps live in `src-tauri/`.
+
+- **Phase 1 = read-only** (current): a background task connects to Gateway (or
+  falls back to demo data offline), runs `data::gather`, caches a `Snapshot`, and
+  emits it to the webview. **No order transmit** — the preview→arm→execute safety
+  flow stays in the TUI. Phase 2 will extract a `Session` core from `tui::app::App`
+  so the desktop can transmit through the *same* guardrailed code.
+- **Auto-update** = `tauri-plugin-updater` (minisign, `native-tls` to dodge the
+  cargo-xwin/`ring` cross-compile break). It checks `latest.json` on **this repo's**
+  GitHub Releases (`betterwheel/betterwheel`). The updater fetches anonymously, so **the
+  repo MUST be public** for auto-update to work — releases on a private repo can't be
+  downloaded without auth (it's currently private; auto-update goes live when it's
+  made public). `dist/update.js` drives check → download → `process.relaunch()`.
+  macOS isn't notarized (right-click→Open first run) and uses no TCC permission, so
+  the default ad-hoc signature is fine — the updater only verifies the **minisign**
+  signature.
+- **Releasing** (local, no CI): bump the version in `tauri.conf.json` +
+  `package.json` + `src-tauri/Cargo.toml`, then `scripts/release.sh "notes…"`
+  (cross-compiles Windows via cargo-xwin → NSIS installer, builds the macOS
+  bundle, minisigns the artifacts, writes `latest.json`, `gh release create` on the
+  releases repo). Do **not** mark the release `--prerelease` (the `releases/latest`
+  endpoint skips prereleases, hiding them from the updater). Authenticode is opt-in
+  (`SKIP_AUTHENTICODE=0` + the `betterwheel-signing` keychain item).
+- **Updater key:** `~/.tauri/betterwheel-updater.key` (passwordless; pubkey embedded
+  in `tauri.conf.json`). Never commit it; losing it bricks auto-update for installed
+  apps — back it up.
+
 ## Conventions & gotchas
 
-- **Logging is file-only** (`<data_dir>/logs/thewheel.log`). Never log to stdout/
+- **Logging is file-only** (`<data_dir>/logs/betterwheel.log`). Never log to stdout/
   stderr from the TUI path — it corrupts ratatui's alternate screen. (The `spike`
   binary logs to stderr because it has no TUI.)
 - **Money is `f64`** throughout (prices, premium, collateral). No decimal type.

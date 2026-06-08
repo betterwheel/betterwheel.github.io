@@ -1,4 +1,4 @@
-//! TheWheel — an options *wheel strategy* assistant for Interactive Brokers.
+//! BetterWheel — an options *wheel strategy* assistant for Interactive Brokers.
 //!
 //! The crate is split into independent layers so the strategy logic can be
 //! tested without a broker connection:
@@ -9,6 +9,7 @@
 //! Later layers (`ibkr`, `store`, `tui`) wrap this core with IO.
 
 pub mod config;
+pub mod data;
 pub mod engine;
 pub mod ibkr;
 pub mod positions;

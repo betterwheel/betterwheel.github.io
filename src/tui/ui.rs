@@ -53,7 +53,7 @@ fn render_tabs(frame: &mut Frame, app: &App, area: Rect) {
         n => format!("  ⚡ {n} AUTO-TRADING"),
     };
     let title = format!(
-        "TheWheel  [{}]  {conn}{sync}  ·  {} open{armed}{auto}",
+        "BetterWheel  [{}]  {conn}{sync}  ·  {} open{armed}{auto}",
         app.mode_label(),
         app.open_position_count()
     );

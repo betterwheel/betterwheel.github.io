@@ -18,3 +18,12 @@ public_key*
 *.sqlite
 *.sqlite3
 *.log
+
+# Tauri desktop build artifacts
+/src-tauri/target
+/src-tauri/gen
+/node_modules
+
+# Public Microsoft code-signing roots — safe to commit despite *.pem above
+# (verifies the bundled WebView2 bootstrapper at installer-build time)
+!scripts/microsoft-roots.pem

@@ -1,0 +1,9 @@
+# Statically link the CRT for the Windows targets. Without this the .exe imports
+# VCRUNTIME140.dll / VCRUNTIME140_1.dll and fails silently on machines without
+# the VC++ Redistributable (no Event Viewer entry, no stderr). Don't remove this
+# without also bundling vc_redist in the installer.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
