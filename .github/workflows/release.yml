@@ -1,0 +1,158 @@
+name: Build & publish unsigned releases
+
+# Builds UNSIGNED desktop binaries — Windows (x64 + arm64, native) and macOS
+# (universal: Intel + Apple Silicon lipo'd into one .app) — and publishes them as
+# a PRERELEASE GitHub Release on THIS repo (betterwheel/betterwheel).
+#
+# Trigger: a push to a release/** branch ONLY (e.g. release/0.2.0). Never runs on
+# main. These are convenience/test builds: unsigned, so Windows SmartScreen and
+# macOS Gatekeeper warn on first run, AND deliberately marked --prerelease so the
+# in-app updater (which reads releases/latest and skips prereleases) never serves
+# them. The SIGNED release plus the updater latest.json is produced separately by
+# scripts/release.sh, which reuses this tag: it clobbers these assets with signed
+# ones and promotes the prerelease to a full release.
+#
+# No secrets: the built-in GITHUB_TOKEN (contents: write) publishes here.
+
+on:
+  push:
+    branches:
+      - 'release/**'
+
+env:
+  # Run JS actions on Node 24 ahead of the default switch (silences the Node 20
+  # deprecation notice on checkout / rust-cache / msvc-dev-cmd).
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-windows:
+    name: Windows ${{ matrix.arch }}
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            arch: x64
+            msvc: amd64
+          - target: aarch64-pc-windows-msvc
+            arch: arm64
+            msvc: amd64_arm64
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Add Rust target
+        run: rustup target add ${{ matrix.target }}
+
+      # Activate the MSVC toolchain for the target so sqlx's bundled sqlite (C)
+      # compiles; arm64 needs the amd64_arm64 cross compiler.
+      - name: Set up MSVC (${{ matrix.msvc }})
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: ${{ matrix.msvc }}
+
+      # The desktop bin lives in the src-tauri crate (it path-deps the root lib).
+      - name: Build desktop (release)
+        working-directory: src-tauri
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Stage artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          cp "src-tauri/target/${{ matrix.target }}/release/betterwheel-desktop.exe" \
+             "out/betterwheel-windows-${{ matrix.arch }}.exe"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: betterwheel-windows-${{ matrix.arch }}
+          path: out/betterwheel-windows-${{ matrix.arch }}.exe
+          if-no-files-found: error
+
+  build-macos:
+    name: macOS universal
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v6
+
+      # Both arches are required for the universal (lipo'd) binary.
+      - name: Add Rust targets
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
+      - name: Install Tauri CLI (devDependency)
+        run: npm ci
+
+      # Unsigned universal build (Intel + Apple Silicon in one .app). Tauri builds
+      # both arches and lipos them. createUpdaterArtifacts is forced off (it's true
+      # in tauri.conf.json) so the bundler doesn't require the minisign updater key,
+      # which lives only on the maintainer's machine. --bundles app skips the dmg
+      # bundler (it drives Finder via AppleScript and fails on headless runners).
+      - name: Build universal app bundle (unsigned, no updater artifacts)
+        run: npx tauri build --target universal-apple-darwin --bundles app --config '{"bundle":{"createUpdaterArtifacts":false}}'
+
+      - name: Stage artifacts (.app.tar.gz + .dmg)
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION=$(node -p "require('./src-tauri/tauri.conf.json').version")
+          BUNDLE="src-tauri/target/universal-apple-darwin/release/bundle/macos"
+          APP="$(ls -d "$BUNDLE"/*.app | head -1)"
+          mkdir -p out
+          tar -czf "out/betterwheel-macos-universal.app.tar.gz" -C "$BUNDLE" "$(basename "$APP")"
+          hdiutil create -quiet -volname "BetterWheel" -srcfolder "$APP" \
+            -ov -format UDZO "out/betterwheel-${VERSION}-macos-universal.dmg"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: betterwheel-macos-universal
+          path: out/*
+          if-no-files-found: error
+
+  publish:
+    name: Publish prerelease
+    needs: [build-windows, build-macos]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create or update prerelease on this repo
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          BRANCH: ${{ github.ref_name }}
+          SRC_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          VERSION=$(node -p "require('./src-tauri/tauri.conf.json').version")
+          TAG="v$VERSION"
+          DMG="betterwheel-${VERSION}-macos-universal.dmg"
+          NOTES="Automated **unsigned** CI build from branch \`${BRANCH}\` (commit \`${SRC_SHA}\`).
+
+          Windows SmartScreen and macOS Gatekeeper warn on first run because these
+          builds are unsigned. The signed release (with the updater manifest) is
+          published separately via scripts/release.sh, which reuses this tag."
+          if ! gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+            gh release create "$TAG" --repo "$REPO" \
+              --title "BetterWheel $TAG (unsigned CI)" \
+              --notes "$NOTES" \
+              --prerelease \
+              --target "$SRC_SHA"
+          fi
+          gh release upload "$TAG" --repo "$REPO" --clobber \
+            "artifacts/betterwheel-windows-x64.exe" \
+            "artifacts/betterwheel-windows-arm64.exe" \
+            "artifacts/betterwheel-macos-universal.app.tar.gz" \
+            "artifacts/${DMG}"
