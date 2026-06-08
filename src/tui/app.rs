@@ -131,9 +131,18 @@ pub enum Action {
     SlotProfit(i32),
 }
 
+/// Which ranked list a desktop command addresses (the desktop has no tab state,
+/// so it names the list explicitly). See `App::ui_preview` / `ui_execute`.
+#[derive(Clone, Copy, Debug)]
+pub enum SugList {
+    Classic,
+    Hedged,
+    ZeroDte,
+}
+
 /// A result from an off-loop broker task, delivered to the run loop so broker
 /// I/O (reconnects, data reloads) never blocks the UI thread.
-pub(super) enum BrokerUpdate {
+pub enum BrokerUpdate {
     /// An auto-reconnect attempt succeeded.
     Connected(Arc<Ibkr>),
     /// An auto-reconnect attempt failed; carries a short UI hint.
@@ -370,6 +379,63 @@ impl App {
             // hold no current structure (`None`).
             Tab::ZeroDte => self.zerodte_suggestions.get(self.selected).and_then(|o| o.as_ref()),
             _ => None,
+        }
+    }
+
+    // --- Desktop command surface ------------------------------------------
+    // Thin `pub` wrappers an alternative front-end (the Tauri app) calls to drive
+    // the SAME order logic the TUI runs — the guardrails, arm gate, live-confirm,
+    // and auto-disarm all live in `preview_suggestion`/`execute_suggestion` and are
+    // untouched here. Suggestions are addressed by (list, index) since the desktop
+    // has no tab/selection state.
+
+    /// The suggestion at `(list, index)`, cloned, if it exists.
+    fn sug_at(&self, list: SugList, i: usize) -> Option<Suggestion> {
+        match list {
+            SugList::Classic => self.suggestions.get(i).cloned(),
+            SugList::Hedged => self.hedged_suggestions.get(i).cloned(),
+            SugList::ZeroDte => self.zerodte_suggestions.get(i).and_then(|o| o.clone()),
+        }
+    }
+
+    /// Preview (what-if, never transmits) the suggestion at `(list, index)`.
+    pub async fn ui_preview(&mut self, list: SugList, i: usize, store: &Store) -> Result<()> {
+        if let Some(s) = self.sug_at(list, i) {
+            self.preview_suggestion(&s, store).await?;
+        }
+        Ok(())
+    }
+
+    /// Execute the suggestion at `(list, index)` — runs the full guardrail stack
+    /// (armed / read_only / max_contracts / live-confirm / aggregate cap) and
+    /// auto-disarms on a successful single-leg submit, exactly as the TUI does.
+    pub async fn ui_execute(&mut self, list: SugList, i: usize, store: &Store) -> Result<()> {
+        if let Some(s) = self.sug_at(list, i) {
+            self.execute_suggestion(&s, store).await?;
+        }
+        Ok(())
+    }
+
+    /// Arm or disarm (the deliberate pre-transmit gate; `x`/execute only fires armed).
+    pub fn ui_set_armed(&mut self, on: bool) {
+        self.armed = on;
+        self.status = if on {
+            "ARMED — execute will transmit a real order".into()
+        } else {
+            "disarmed".into()
+        };
+    }
+
+    /// Confirm live trading for this session by typing [`LIVE_CONFIRM_PHRASE`].
+    pub fn ui_confirm_live(&mut self, phrase: &str) -> bool {
+        if phrase.trim() == LIVE_CONFIRM_PHRASE {
+            self.live_confirmed = true;
+            self.status = "✓ LIVE trading confirmed for this session".into();
+            true
+        } else {
+            self.status =
+                format!("phrase mismatch — LIVE trading still locked (type {LIVE_CONFIRM_PHRASE})");
+            false
         }
     }
 
@@ -1397,7 +1463,7 @@ impl App {
     /// execution — nothing transmits under `read_only`, while offline, or above
     /// `max_contracts_per_order`. The per-slot `automate` flag is the standing,
     /// deliberate opt-in (this app's "friction generator").
-    pub(super) async fn tick_zerodte(&mut self, store: &Store) {
+    pub async fn tick_zerodte(&mut self, store: &Store) {
         if self.cfg.guardrails.read_only {
             return;
         }
@@ -1983,12 +2049,12 @@ impl App {
     }
 
     /// Wire the channel the run loop uses to receive off-loop broker results.
-    pub(super) fn set_update_sender(&mut self, tx: mpsc::UnboundedSender<BrokerUpdate>) {
+    pub fn set_update_sender(&mut self, tx: mpsc::UnboundedSender<BrokerUpdate>) {
         self.update_tx = Some(tx);
     }
 
     /// Adopt a connection established by auto-reconnect.
-    pub(super) fn set_connected(&mut self, ibkr: Arc<Ibkr>) {
+    pub fn set_connected(&mut self, ibkr: Arc<Ibkr>) {
         self.ibkr = Some(ibkr);
         self.connected = true;
         self.offline_reason = None;
@@ -1999,7 +2065,7 @@ impl App {
     /// Clears the client and stale account so the UI stops claiming "live"; the
     /// last suggestions stay visible but are non-executable (the execute path is
     /// gated on a live `ibkr`). The caller restarts the reconnect loop.
-    pub(super) fn set_disconnected(&mut self, reason: String) {
+    pub fn set_disconnected(&mut self, reason: String) {
         self.ibkr = None;
         self.connected = false;
         self.account = None;
@@ -2010,7 +2076,7 @@ impl App {
     }
 
     /// Record why we're offline (shown on the dashboard).
-    pub(super) fn set_offline_reason(&mut self, reason: String) {
+    pub fn set_offline_reason(&mut self, reason: String) {
         self.offline_reason = Some(reason);
     }
 
@@ -2033,7 +2099,7 @@ impl App {
     /// Refresh data. When connected, the heavy broker gather runs on a spawned
     /// task and lands later via [`App::apply_live_data`], so the UI thread never
     /// blocks; offline it just recomputes demo data inline (cheap, no broker I/O).
-    pub(super) async fn request_reload(&mut self, store: &Store) {
+    pub async fn request_reload(&mut self, store: &Store) {
         let (Some(ibkr), Some(tx)) = (self.ibkr.clone(), self.update_tx.clone()) else {
             if let Err(e) = self.reload(store).await {
                 self.status = format!("refresh failed: {e}");
@@ -2059,7 +2125,7 @@ impl App {
 
     /// Apply a finished background reload (see [`App::request_reload`]), preserving
     /// the safety rule that an incomplete positions snapshot must not look empty.
-    pub(super) async fn apply_live_data(&mut self, d: LiveData, store: &Store) {
+    pub async fn apply_live_data(&mut self, d: LiveData, store: &Store) {
         self.account = d.account;
         // Re-read membership on the loop instead of trusting the gather's
         // (possibly pre-deletion) snapshot, so a delete during a slow gather
