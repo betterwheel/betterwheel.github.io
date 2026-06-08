@@ -1,0 +1,78 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+#
+# CodeRabbit config for betterwheel/betterwheel. The CodeRabbit GitHub App is
+# installed org-wide (all repos); this file makes its review deliberate rather
+# than default. It reviews PRs into main — see CONTRIBUTING note: main is branch-
+# protected, so all changes land via PR.
+language: en-US
+early_access: false
+
+reviews:
+  # "chill" keeps nitpicks down for a small team; the architectural rigor lives
+  # in path_instructions below. Flip to "assertive" for deeper, noisier reviews.
+  profile: chill
+  request_changes_workflow: false
+  high_level_summary: true
+  poem: false
+  review_status: true
+  collapse_walkthrough: false
+
+  auto_review:
+    enabled: true
+    drafts: false
+    base_branches:
+      - main
+
+  # Skip vendored / generated / archived paths — reviewing them is pure noise.
+  path_filters:
+    - "!dist/**"                 # build-free static frontend (vendored, no review value)
+    - "!src-tauri/gen/**"        # Tauri-generated scaffolding
+    - "!docs/legacy-webapi/**"   # archived, abandoned Web API/OAuth layer
+    - "!**/*.lock"               # Cargo.lock / other lockfiles
+    - "!package-lock.json"
+
+  # Encode the invariants from CLAUDE.md so reviews are architecture-aware.
+  path_instructions:
+    - path: "src/engine/**"
+      instructions: >-
+        Pure strategy logic with ZERO I/O — flag any file/network/DB access,
+        broker calls, or `ibapi` usage here; this layer must stay broker-agnostic
+        and fully unit-testable. Money is f64 throughout (no decimal type).
+    - path: "src/ibkr/**"
+      instructions: >-
+        The SOLE `ibapi` boundary. `ibapi` must not be imported anywhere outside
+        this module. Every streaming request must be bounded by a timeout. All
+        order entry must go through `submit_or_preview` / `submit_or_preview_combo`
+        so preview (what-if) and live paths cannot diverge. Index option order
+        prices tick in $0.05 (an off-tick combo limit hangs on IBKR error 110).
+    - path: "src/positions.rs"
+      instructions: >-
+        Pure broker→wheel-state reconciliation, no I/O. An incomplete or failed
+        positions snapshot must be treated as "unknown", NEVER as "account is
+        empty" — a failed fetch must not wipe wheel state or surface stale
+        executable suggestions. Preserve this distinction in any change.
+    - path: "src/tui/ui.rs"
+      instructions: >-
+        Must remain a PURE render function of `App` — no side effects, no async,
+        no I/O. Flag anything that mutates state or performs work here.
+    - path: "src/tui/app.rs"
+      instructions: >-
+        Guardrails (read_only, max_contracts_per_order, max_total_deployed) must
+        be enforced in `execute_suggestion` regardless of engine output. Transmit
+        is a 3-step gate: preview → arm → execute, and a live submit auto-disarms.
+        0DTE auto-management is opt-in per slot and defaults OFF — do not weaken
+        these gates.
+    - path: "migrations/**"
+      instructions: >-
+        SQLite schema migrations (run automatically on Store::open). Flag
+        destructive or non-idempotent changes and any migration that could drop
+        wheel metadata IBKR cannot re-report (which leg, cost basis, cumulative
+        premium).
+    - path: ".github/workflows/**"
+      instructions: >-
+        Flag any use of untrusted event input (titles, branch names, commit
+        messages) interpolated directly into `run:` — it must be passed via `env:`
+        and referenced as a shell variable instead.
+
+chat:
+  auto_reply: true

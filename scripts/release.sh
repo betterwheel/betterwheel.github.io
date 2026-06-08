@@ -47,8 +47,21 @@ SETUP_EXE="${ROOT}/src-tauri/target/betterwheel-setup-${VERSION}.exe"
 
 [ -f "${UPDATER_KEY}" ] || { echo "error: updater key missing: ${UPDATER_KEY}" >&2; exit 1; }
 command -v makensis >/dev/null 2>&1 || { echo "error: makensis not on PATH (port/brew install nsis)" >&2; exit 1; }
-gh release view "${TAG}" --repo "${RELEASES_REPO}" >/dev/null 2>&1 \
-  && { echo "error: ${TAG} already exists on ${RELEASES_REPO} — bump the version first" >&2; exit 1; }
+# The release/** CI (.github/workflows/release.yml) may have already created this
+# tag as an UNSIGNED prerelease. That's fine — we reuse it below (clobber its
+# assets with the signed ones and promote it to a full release). Only a tag that
+# already exists as a *full* release is a hard stop: that's an already-published
+# signed release, so bump the version instead of overwriting it.
+EXISTING_PRERELEASE=""
+if gh release view "${TAG}" --repo "${RELEASES_REPO}" >/dev/null 2>&1; then
+  if [ "$(gh release view "${TAG}" --repo "${RELEASES_REPO}" --json isPrerelease -q .isPrerelease)" = "true" ]; then
+    echo ">> ${TAG} exists as an unsigned CI prerelease — will clobber its assets and promote to a full release"
+    EXISTING_PRERELEASE=1
+  else
+    echo "error: ${TAG} already published (full release) on ${RELEASES_REPO} — bump the version first" >&2
+    exit 1
+  fi
+fi
 
 echo ">> building Windows binaries (x64 + arm64)"
 "${ROOT}/scripts/build-windows.sh" release all
@@ -124,14 +137,26 @@ cp "${MAC_DMG}" "${STAGE}/betterwheel-${VERSION}-macos-arm64.dmg"
 cp "${MAC_TARGZ}" "${STAGE}/betterwheel-macos-arm64.app.tar.gz"
 cp "${LATEST}" "${STAGE}/latest.json"
 
-echo ">> publishing ${TAG} to ${RELEASES_REPO}"
-gh release create "${TAG}" --repo "${RELEASES_REPO}" \
-  --title "BetterWheel ${VERSION}" --notes "${NOTES}" \
-  "${STAGE}/betterwheel-setup-${VERSION}.exe" \
-  "${STAGE}/betterwheel-windows-x64.exe" \
-  "${STAGE}/betterwheel-windows-arm64.exe" \
-  "${STAGE}/betterwheel-${VERSION}-macos-arm64.dmg" \
-  "${STAGE}/betterwheel-macos-arm64.app.tar.gz" \
+REL_ASSETS=(
+  "${STAGE}/betterwheel-setup-${VERSION}.exe"
+  "${STAGE}/betterwheel-windows-x64.exe"
+  "${STAGE}/betterwheel-windows-arm64.exe"
+  "${STAGE}/betterwheel-${VERSION}-macos-arm64.dmg"
+  "${STAGE}/betterwheel-macos-arm64.app.tar.gz"
   "${STAGE}/latest.json"
+)
+if [ -n "${EXISTING_PRERELEASE}" ]; then
+  # Reuse the CI prerelease: replace its unsigned assets with the signed ones and
+  # promote it to a full release. The updater reads releases/latest, which skips
+  # prereleases, so the new version only becomes visible to clients once promoted.
+  echo ">> promoting CI prerelease ${TAG} on ${RELEASES_REPO} (clobbering unsigned assets)"
+  gh release upload "${TAG}" --repo "${RELEASES_REPO}" --clobber "${REL_ASSETS[@]}"
+  gh release edit "${TAG}" --repo "${RELEASES_REPO}" \
+    --title "BetterWheel ${VERSION}" --notes "${NOTES}" --prerelease=false
+else
+  echo ">> publishing ${TAG} to ${RELEASES_REPO}"
+  gh release create "${TAG}" --repo "${RELEASES_REPO}" \
+    --title "BetterWheel ${VERSION}" --notes "${NOTES}" "${REL_ASSETS[@]}"
+fi
 
 echo ">> done: https://github.com/${RELEASES_REPO}/releases/tag/${TAG}"
