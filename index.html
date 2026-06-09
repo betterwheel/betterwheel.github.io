@@ -100,6 +100,52 @@
           </div>
         </div>
 
+        <div class="grid two mt">
+          <div class="card">
+            <h3>Selling the put</h3>
+            <p>
+              BetterWheel scans each watchlist name's option chain for
+              out-of-the-money puts, filters by moneyness — by delta, or a
+              Black-Scholes delta rebuilt from implied volatility when IBKR
+              reports no greek — and ranks every candidate by <em>annualized</em>
+              return on the cash you'd post as collateral. You take the premium up
+              front; above the strike the put expires worthless and you keep it,
+              below it you're assigned the shares at a price you already chose.
+            </p>
+          </div>
+          <div class="card">
+            <h3>Writing the call</h3>
+            <p>
+              Holding an assigned lot, the <code>covered_call</code> selector
+              looks for a call to write <strong>above your cost basis</strong>, so
+              being called away still books a gain while the premium keeps lowering
+              that basis. BetterWheel tracks the basis and the running premium
+              itself — IBKR can't tell you which leg of the wheel a position is on.
+            </p>
+          </div>
+          <div class="card">
+            <h3>Managing what's open</h3>
+            <p>
+              Trades aren't fire-and-forget. The <code>manage</code> selector
+              proposes <strong>take-profit</strong> closes — buying a short back
+              cheap once most of its premium has decayed — and
+              <strong>rolls</strong>, closing a threatened leg and reopening it
+              further out in time or strike to keep the wheel turning instead of
+              taking a bad assignment.
+            </p>
+          </div>
+          <div class="card">
+            <h3>What's ranked first</h3>
+            <p>
+              Every connected reload yields one ranked list, and
+              <code>plan()</code> sorts <strong>management before new
+              entries</strong> — tending what you already hold beats opening fresh
+              risk — then by annualized yield. You act from the top; nothing fires
+              on its own.
+            </p>
+          </div>
+        </div>
+
         <figure class="payoff">
           <!-- Cash-secured put payoff at expiry -->
           <svg viewBox="0 0 480 200" role="img" aria-label="Cash-secured put payoff at expiry">
@@ -119,6 +165,20 @@
           </svg>
           <figcaption>Cash-secured put — premium is capped; downside is owning the shares at the strike.</figcaption>
         </figure>
+
+        <div class="card impl mt">
+          <h3>Under the hood</h3>
+          <p>
+            The strategy is a pure, broker-agnostic <code>engine/</code>: three
+            selectors — <code>csp</code> (entry), <code>covered_call</code>
+            (post-assignment income) and <code>manage</code> (take-profit / roll)
+            — over plain types, with zero I/O and exhaustive unit tests. A separate
+            reconciler folds your raw IBKR holdings into wheel state (which symbol
+            sits at which leg, the share lot, the open short), and a local SQLite
+            store keeps what the broker doesn't: cost basis, cumulative premium,
+            pending rolls.
+          </p>
+        </div>
       </section>
 
       <!-- 0DTE STRUCTURES ------------------------------------------------ -->
@@ -141,6 +201,19 @@
           <div class="chip">Short strangle <span class="muted">· gated</span></div>
         </div>
 
+        <dl class="defs">
+          <dt>Iron condor</dt>
+          <dd>Sell an out-of-the-money put spread and call spread together; keep both credits as long as price stays between the short strikes. Defined risk on each wing.</dd>
+          <dt>Put / call credit spread</dt>
+          <dd>The one-sided version — sell a single spread on the side you don't expect price to reach. Max profit is the credit; max loss is the width less the credit.</dd>
+          <dt>Broken-wing fly</dt>
+          <dd>A butterfly with unequal wings that skews the risk to one side, often opened for a credit so the other side carries little or no loss.</dd>
+          <dt>Iron fly</dt>
+          <dd>A short straddle wrapped in long wings: a fatter credit than a condor in exchange for a narrow profit zone centred on the strike.</dd>
+          <dt>Short strangle <span class="muted">· gated</span></dt>
+          <dd>A naked short put and call — the only undefined-risk structure here, so it sits behind an extra gate.</dd>
+        </dl>
+
         <figure class="payoff">
           <!-- Iron condor payoff -->
           <svg viewBox="0 0 480 200" role="img" aria-label="Iron condor payoff at expiry">
@@ -157,6 +230,103 @@
           </svg>
           <figcaption>Iron condor — collect the credit while price stays between the short strikes; the wings are the stop.</figcaption>
         </figure>
+
+        <div class="card impl mt">
+          <h3>Under the hood</h3>
+          <p>
+            Each structure is a pure selector over a both-sides chain that emits a
+            single <code>OpenStructure { kind, legs }</code> action, and one generic
+            <strong>piecewise-linear payoff engine</strong> —
+            <code>payoff_at</code>, <code>max_loss_per_share</code>,
+            <code>breakevens</code> — derives the risk, reward and breakevens for
+            <em>any</em> leg set (that's what draws every payoff curve). Because
+            SPX/SPXW are cash-settled and European, there's no assignment and no
+            shares: these live entirely outside the wheel's state machine and go to
+            market as one guaranteed combo order, priced to IB's $0.05 index tick.
+          </p>
+        </div>
+        <div class="card mt">
+          <h3>Hands-off — only if you ask</h3>
+          <p>
+            Any 0DTE slot can be set to automate: a 30-second scheduler enters at
+            your configured time and places a standing profit-close on fill — the
+            long wings <em>are</em> the stop, so there's no separate stop order.
+            It's off by default, per slot, still bound by every guardrail, and a
+            loud <code>⚡ AUTO-TRADING</code> banner shows whenever a slot is live.
+          </p>
+        </div>
+      </section>
+
+      <!-- IB GATEWAY ----------------------------------------------------- -->
+      <section>
+        <h2>Talking to Interactive Brokers</h2>
+        <p class="lead">
+          BetterWheel has no brokerage of its own — it drives <strong>your</strong>
+          Interactive Brokers account through IB's local API. You keep IB Gateway
+          (or TWS) running; BetterWheel connects to it over a socket with the
+          <code>ibapi</code> Rust crate, reads your positions and the live option
+          chains, and routes every order back through it. Nothing of yours goes
+          anywhere but to IB.
+        </p>
+
+        <div class="grid two">
+          <div class="card">
+            <h3>What IB Gateway is</h3>
+            <p>
+              A small, headless companion app from Interactive Brokers that holds
+              your authenticated session and exposes the trading API on a local
+              port — the lightweight alternative to the full Trader Workstation
+              (same API, no charts). BetterWheel talks to whichever one you have
+              open.
+            </p>
+          </div>
+          <div class="card">
+            <h3>Paper first, live on purpose</h3>
+            <p>
+              It defaults to the <strong>paper</strong> port and only goes live
+              when you deliberately switch. Reconnect, timeouts and guardrails
+              behave identically either way — paper is just a different port and a
+              different account.
+            </p>
+          </div>
+        </div>
+
+        <ul class="spec mt">
+          <li><span class="k">Gateway · paper</span> port 4002 — BetterWheel's default</li>
+          <li><span class="k">Gateway · live</span> port 4001</li>
+          <li><span class="k">TWS · paper / live</span> ports 7497 / 7496</li>
+          <li><span class="k">Enable the API</span> in Gateway/TWS settings, with 127.0.0.1 trusted</li>
+          <li><span class="k">Probe it</span> <code>cargo run --bin spike -- AAPL</code> — a read-only connectivity check</li>
+        </ul>
+
+        <div class="card note mt">
+          <h3>The gotcha worth knowing up front</h3>
+          <p>
+            Connecting isn't the same as getting prices. Even on a paper account,
+            IB returns <em>no</em> option quotes or greeks — so the Suggestions tab
+            stays empty — until you finish the market-data setup in the IBKR client
+            portal: the <strong>Market Data API access configuration</strong>, the
+            <strong>Non-Commercial Form</strong>, your <strong>subscriber
+            status</strong>, and an actual options subscription (OPRA for US
+            options). The app connects fine without it; it just can't rank anything
+            until the data flows. Offline demo mode is unaffected.
+          </p>
+        </div>
+
+        <div class="card impl mt">
+          <h3>Under the hood</h3>
+          <p>
+            All of IB sits behind a single boundary: one module owns the
+            <code>ibapi</code> client and maps its types into plain structs, every
+            streaming request is bounded by a timeout, and one
+            <code>submit_or_preview</code> entry point keeps the what-if and live
+            order paths from ever diverging. An incomplete snapshot is treated as
+            <em>unknown</em>, never as "your account is empty," so a dropped
+            connection can't wipe your wheel state — and if the Gateway isn't
+            reachable within five seconds at startup, the app falls back to
+            Black-Scholes-consistent demo data so it's always usable.
+          </p>
+        </div>
       </section>
 
       <!-- SAFETY --------------------------------------------------------- -->
@@ -183,15 +353,12 @@
         </div>
       </section>
 
-      <!-- CONNECT -------------------------------------------------------- -->
+      <!-- CLOSING -------------------------------------------------------- -->
       <section class="closing">
-        <h2>How it connects</h2>
+        <h2>Get BetterWheel</h2>
         <p class="lead">
-          One boundary owns the broker: it maps IB data into plain structs, bounds
-          every streaming request with a timeout, and routes every order through a
-          single preview-or-submit entry point so the what-if and live paths can't
-          diverge. An incomplete snapshot is treated as <em>unknown</em> — never as
-          "your account is empty" — so a dropped connection can't wipe your state.
+          Free and open source under the AGPL-3.0. Paper-trade it first, read every
+          line if you like, and arm nothing you don't understand.
         </p>
         <div class="cta">
           <a class="btn primary" href="https://github.com/betterwheel/betterwheel.github.io/releases">Get BetterWheel</a>
