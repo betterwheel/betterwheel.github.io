@@ -163,6 +163,36 @@ h3 { margin: 0 0 0.4rem; font-size: 1.05rem; }
 }
 
 .card.safe { border-left: 3px solid var(--green); }
+.card.impl { border-left: 3px solid var(--teal); }
+.card.note { border-left: 3px solid var(--gold); }
+
+.mt { margin-top: 1.25rem; }
+
+/* labeled spec rows (IB Gateway ports & setup) */
+.spec { list-style: none; margin: 0; padding: 0; display: grid; gap: 0.5rem; }
+.spec li {
+  display: grid;
+  grid-template-columns: 11rem 1fr;
+  gap: 0.75rem;
+  align-items: baseline;
+  padding: 0.55rem 0.85rem;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 0.55rem;
+  font-size: 0.93rem;
+  color: var(--muted);
+}
+.spec .k { color: var(--text); font-weight: 600; }
+
+/* structure glossary */
+.defs { margin: 1.5rem 0 0; }
+.defs dt { font-weight: 700; color: var(--gold); margin-top: 0.9rem; }
+.defs dt:first-child { margin-top: 0; }
+.defs dd { margin: 0.2rem 0 0; color: var(--muted); font-size: 0.95rem; max-width: 64ch; }
+
+@media (max-width: 720px) {
+  .spec li { grid-template-columns: 1fr; gap: 0.15rem; }
+}
 
 /* structure chips */
 .structures { grid-template-columns: repeat(3, 1fr); }
